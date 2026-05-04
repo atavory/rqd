@@ -1,0 +1,124 @@
+{
+  "movielens": [
+    {
+      "seed": 0,
+      "recall_frozen": 0.004359490274983233,
+      "recall_full_no_ds": 0.005009221998658619,
+      "recall_full_with_ds": 0.05067907444668008,
+      "recall_stratified": 0.004359490274983233,
+      "mse_frozen": 611.3412475585938,
+      "mse_full": 116.33565521240234,
+      "mse_warm": 233.6443328857422,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 1,
+      "recall_frozen": 0.008760898725687458,
+      "recall_full_no_ds": 0.007566230717639169,
+      "recall_full_with_ds": 0.05160127431254192,
+      "recall_stratified": 0.008760898725687458,
+      "mse_frozen": 614.5687866210938,
+      "mse_full": 118.30052947998047,
+      "mse_warm": 230.28819274902344,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 2,
+      "recall_frozen": 0.0051140174379611,
+      "recall_full_no_ds": 0.00829979879275654,
+      "recall_full_with_ds": 0.051978537894030855,
+      "recall_stratified": 0.0051140174379611,
+      "mse_frozen": 609.4242553710938,
+      "mse_full": 119.66419219970703,
+      "mse_warm": 237.99156188964844,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 3,
+      "recall_frozen": 0.011653252850435948,
+      "recall_full_no_ds": 0.01056338028169014,
+      "recall_full_with_ds": 0.052774983232729715,
+      "recall_stratified": 0.011653252850435948,
+      "mse_frozen": 638.1334228515625,
+      "mse_full": 118.40510559082031,
+      "mse_warm": 226.5811309814453,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 4,
+      "recall_frozen": 0.005030181086519115,
+      "recall_full_no_ds": 0.007650067069081154,
+      "recall_full_with_ds": 0.05191566063044936,
+      "recall_stratified": 0.005030181086519115,
+      "mse_frozen": 633.2837524414062,
+      "mse_full": 116.02774810791016,
+      "mse_warm": 225.04159545898438,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 5,
+      "recall_frozen": 0.009787894030851778,
+      "recall_full_no_ds": 0.005072099262240107,
+      "recall_full_with_ds": 0.05243963782696177,
+      "recall_stratified": 0.009787894030851778,
+      "mse_frozen": 611.9378662109375,
+      "mse_full": 116.46002960205078,
+      "mse_warm": 244.63589477539062,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 6,
+      "recall_frozen": 0.014189302481556003,
+      "recall_full_no_ds": 0.00727280348759222,
+      "recall_full_with_ds": 0.05300553319919517,
+      "recall_stratified": 0.014189302481556003,
+      "mse_frozen": 646.5264282226562,
+      "mse_full": 116.52266693115234,
+      "mse_warm": 233.38424682617188,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 7,
+      "recall_frozen": 0.01006036217303823,
+      "recall_full_no_ds": 0.006664989939637827,
+      "recall_full_with_ds": 0.05107729711602951,
+      "recall_stratified": 0.01006036217303823,
+      "mse_frozen": 636.9293212890625,
+      "mse_full": 119.04841613769531,
+      "mse_warm": 230.81924438476562,
+      "prefix_change_rate": 0.999190501888829,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 8,
+      "recall_frozen": 0.014524647887323943,
+      "recall_full_no_ds": 0.008278839704896042,
+      "recall_full_with_ds": 0.05147551978537894,
+      "recall_stratified": 0.014524647887323943,
+      "mse_frozen": 604.3704223632812,
+      "mse_full": 118.71160125732422,
+      "mse_warm": 220.60195922851562,
+      "prefix_change_rate": 0.9997301672962763,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 9,
+      "recall_frozen": 0.007964453386988599,
+      "recall_full_no_ds": 0.012407780013413815,
+      "recall_full_with_ds": 0.05149647887323944,
+      "recall_stratified": 0.007964453386988599,
+      "mse_frozen": 620.3217163085938,
+      "mse_full": 114.79206085205078,
+      "mse_warm": 228.02255249023438,
+      "prefix_change_rate": 0.9997301672962763,
+      "prefix_stability": 1.0
+    }
+  ]
+}

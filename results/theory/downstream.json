@@ -1,0 +1,40 @@
+{
+  "movielens": [
+    {
+      "seed": 0,
+      "recall_frozen": 0.007796780684104628,
+      "recall_full_no_ds": 0.004820590207914152,
+      "recall_full_with_ds": 0.0505533199195171,
+      "recall_stratified": 0.007796780684104628,
+      "mse_frozen": 609.544921875,
+      "mse_full": 116.33565521240234,
+      "mse_warm": 226.99066162109375,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 1,
+      "recall_frozen": 0.006769785378940308,
+      "recall_full_no_ds": 0.007587189805499665,
+      "recall_full_with_ds": 0.05181086519114688,
+      "recall_stratified": 0.006769785378940308,
+      "mse_frozen": 612.7783203125,
+      "mse_full": 118.30049133300781,
+      "mse_warm": 226.9282989501953,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    },
+    {
+      "seed": 2,
+      "recall_frozen": 0.008970489604292422,
+      "recall_full_no_ds": 0.008907612340710932,
+      "recall_full_with_ds": 0.051391683433936956,
+      "recall_stratified": 0.008970489604292422,
+      "mse_frozen": 610.9882202148438,
+      "mse_full": 119.67062377929688,
+      "mse_warm": 225.2804718017578,
+      "prefix_change_rate": 1.0,
+      "prefix_stability": 1.0
+    }
+  ]
+}
