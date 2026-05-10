@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -27,11 +28,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 from rq import RQCodebook, warm_retrain
 
 
-def load_amazon(max_items=10000, min_reviews=5):
+def load_amazon(max_items=50000, min_reviews=5):
     """Load Amazon Electronics, temporal split, SVD embeddings."""
     data_path = Path(__file__).parent.parent / "data" / "amazon" / "electronics_5.json.gz"
 
-    print("Loading Amazon Electronics...")
+    log = logging.getLogger(__name__)
+    log.info("Loading Amazon Electronics...")
     reviews = []
     with gzip.open(data_path, "rt") as f:
         for line in f:
@@ -39,7 +41,7 @@ def load_amazon(max_items=10000, min_reviews=5):
             reviews.append((d["reviewerID"], d["asin"],
                           float(d["overall"]), int(d["unixReviewTime"])))
 
-    print(f"  {len(reviews)} total reviews")
+    log.info(f"  {len(reviews)} total reviews")
 
     # Filter to items with >= min_reviews
     from collections import Counter
@@ -67,8 +69,8 @@ def load_amazon(max_items=10000, min_reviews=5):
     old_reviews = [r for r in reviews if r[3] < median_ts]
     new_reviews = [r for r in reviews if r[3] >= median_ts]
 
-    print(f"  {n_users} users, {n_items} items")
-    print(f"  Old: {len(old_reviews)}, New: {len(new_reviews)}")
+    log.info(f"  {n_users} users, {n_items} items")
+    log.info(f"  Old: {len(old_reviews)}, New: {len(new_reviews)}")
 
     def build_sparse(revs):
         rows = [user_map[r[0]] for r in revs if r[0] in user_map and r[1] in item_map]
@@ -85,13 +87,21 @@ def load_amazon(max_items=10000, min_reviews=5):
     mat_new = build_sparse(new_reviews)
 
     d = 64
-    print(f"  SVD embeddings (d={d})...")
+    log.info(f"  SVD embeddings (d={d})...")
     k = min(d, min(mat_old.shape) - 1)
     _, S_old, Vt_old = svds(mat_old, k=k)
     _, S_new, Vt_new = svds(mat_new, k=k)
 
     X_old = (Vt_old.T * S_old).astype(np.float32)
-    X_new = (Vt_new.T * S_new).astype(np.float32)
+    X_new_raw = (Vt_new.T * S_new).astype(np.float32)
+
+    # Procrustes alignment: rotate new embeddings into old coordinate system
+    # This ensures drift is distributional, not a coordinate system artifact
+    from scipy.linalg import orthogonal_procrustes
+    # Use items present in both periods to find the rotation
+    R, _ = orthogonal_procrustes(X_new_raw, X_old)
+    X_new = (X_new_raw @ R).astype(np.float32)
+    log.info(f"  Procrustes alignment applied (residual: {np.mean((X_new_raw @ R - X_old)**2):.2f})")
 
     pairs_old = build_pairs(old_reviews)
     pairs_new = build_pairs(new_reviews)
@@ -142,11 +152,12 @@ def train_reco(model, pairs, item_recon, n_items,
             total_loss += loss.item()
             n_batches += 1
         if (epoch + 1) % 5 == 0:
-            print(f"    epoch {epoch+1}: loss={total_loss/n_batches:.4f}")
+            logging.getLogger(__name__).info(f"    epoch {epoch+1}: loss={total_loss/n_batches:.4f}")
 
 
 @torch.no_grad()
-def eval_recall(model, test_pairs, train_pairs, item_recon, k=10):
+def eval_recall(model, test_pairs, train_pairs, item_recon, k=10,
+                max_eval_users=10000, eval_seed=99):
     recon_t = torch.from_numpy(item_recon).float()
     all_item_proj = model.item_proj(recon_t).numpy()
     train_set = {}
@@ -155,16 +166,22 @@ def eval_recall(model, test_pairs, train_pairs, item_recon, k=10):
     test_set = {}
     for u, i in test_pairs:
         test_set.setdefault(u, set()).add(i)
+    eval_users = [u for u in test_set if u in train_set]
+    if not eval_users:
+        return 0.0
+    if len(eval_users) > max_eval_users:
+        rng = np.random.RandomState(eval_seed)
+        eval_users = list(rng.choice(eval_users, max_eval_users, replace=False))
+    u_ids = torch.tensor(eval_users, dtype=torch.long)
+    u_embs = model.user_emb(u_ids).numpy()
+    scores = u_embs @ all_item_proj.T
     hits = 0
     total = 0
-    for u, test_items in test_set.items():
-        if u not in train_set:
-            continue
-        u_emb = model.user_emb(torch.tensor([u]).long()).numpy()[0]
-        scores = all_item_proj @ u_emb
+    for i, u in enumerate(eval_users):
         for ti in train_set[u]:
-            scores[ti] = -np.inf
-        top_k = set(np.argsort(scores)[-k:])
+            scores[i, ti] = -np.inf
+        top_k = set(np.argpartition(scores[i], -k)[-k:])
+        test_items = test_set[u]
         hits += len(test_items & top_k)
         total += len(test_items)
     return hits / max(total, 1)
@@ -173,14 +190,15 @@ def eval_recall(model, test_pairs, train_pairs, item_recon, k=10):
 def run_experiment(X_old, X_new, pairs_old, pairs_new,
                    n_users, n_items, m=4, K=64, s=2,
                    n_iter=20, seeds=10):
+    log = logging.getLogger(__name__)
     results = []
     for seed in range(seeds):
-        print(f"\n=== Seed {seed} ===")
+        log.info(f"=== Seed {seed} ===")
         rq_t0 = RQCodebook(m, [K] * m, X_old.shape[1])
         rq_t0.fit(X_old, n_iter=n_iter, seed=seed)
         recon_t0 = rq_t0.reconstruct(X_old)
 
-        print("  Training recommender...")
+        log.info("  Training recommender...")
         model = RecoFromReconstruction(n_users, X_old.shape[1], emb_dim=32)
         train_reco(model, pairs_old, recon_t0, n_items, epochs=15, seed=seed)
         model.eval()
@@ -213,10 +231,10 @@ def run_experiment(X_old, X_new, pairs_old, pairs_new,
         pfx_full = np.column_stack(rq_full.encode(X_new, n_stages=s))
         pfx_changed = np.any(pfx_old != pfx_full, axis=1).mean()
 
-        print(f"  Frozen:     R@10={recall_frz:.4f}  MSE={mse_frz:.1f}")
-        print(f"  Full-noDS:  R@10={recall_full_no:.4f}  MSE={mse_full:.1f}")
-        print(f"  Full+DS:    R@10={recall_full_ds:.4f}  MSE={mse_full:.1f}")
-        print(f"  Stratified: R@10={recall_strat:.4f}  MSE={mse_warm:.1f}")
+        log.info(f"  Frozen:     R@10={recall_frz:.4f}  MSE={mse_frz:.1f}")
+        log.info(f"  Full-noDS:  R@10={recall_full_no:.4f}  MSE={mse_full:.1f}")
+        log.info(f"  Full+DS:    R@10={recall_full_ds:.4f}  MSE={mse_full:.1f}")
+        log.info(f"  Stratified: R@10={recall_strat:.4f}  MSE={mse_warm:.1f}")
 
         results.append({
             "seed": seed,
@@ -232,15 +250,15 @@ def run_experiment(X_old, X_new, pairs_old, pairs_new,
 
     r = {k: np.mean([d[k] for d in results]) for k in results[0]}
     s_dev = {k: np.std([d[k] for d in results]) for k in results[0]}
-    print(f"\n{'='*80}")
-    print(f"  Amazon Electronics ({len(results)} seeds)")
-    print(f"{'='*80}")
-    print(f"{'Method':<35} {'Pfx chg':>8} {'DS retr':>8} {'R@10':>12} {'RQ MSE':>12}")
-    print("-" * 80)
-    print(f"{'Frozen':<35} {'0%':>8} {'no':>8} {r['recall_frozen']:.4f}±{s_dev['recall_frozen']:.4f} {r['mse_frozen']:>8.1f}")
-    print(f"{'Full retrain, no DS retrain':<35} {r['prefix_change_rate']:>7.0%} {'no':>8} {r['recall_full_no_ds']:.4f}±{s_dev['recall_full_no_ds']:.4f} {r['mse_full']:>8.1f}")
-    print(f"{'Full retrain + DS retrain':<35} {r['prefix_change_rate']:>7.0%} {'yes':>8} {r['recall_full_ds']:.4f}±{s_dev['recall_full_ds']:.4f} {r['mse_full']:>8.1f}")
-    print(f"{'Stratified plasticity':<35} {'0%':>8} {'no':>8} {r['recall_stratified']:.4f}±{s_dev['recall_stratified']:.4f} {r['mse_warm']:>8.1f}")
+    log.info(f"\n{'='*80}")
+    log.info(f"  Amazon Electronics ({len(results)} seeds)")
+    log.info(f"{'='*80}")
+    log.info(f"{'Method':<35} {'Pfx chg':>8} {'DS retr':>8} {'R@10':>12} {'RQ MSE':>12}")
+    log.info("-" * 80)
+    log.info(f"{'Frozen':<35} {'0%':>8} {'no':>8} {r['recall_frozen']:.4f}±{s_dev['recall_frozen']:.4f} {r['mse_frozen']:>8.1f}")
+    log.info(f"{'Full retrain, no DS retrain':<35} {r['prefix_change_rate']:>7.0%} {'no':>8} {r['recall_full_no_ds']:.4f}±{s_dev['recall_full_no_ds']:.4f} {r['mse_full']:>8.1f}")
+    log.info(f"{'Full retrain + DS retrain':<35} {r['prefix_change_rate']:>7.0%} {'yes':>8} {r['recall_full_ds']:.4f}±{s_dev['recall_full_ds']:.4f} {r['mse_full']:>8.1f}")
+    log.info(f"{'Stratified plasticity':<35} {'0%':>8} {'no':>8} {r['recall_stratified']:.4f}±{s_dev['recall_stratified']:.4f} {r['mse_warm']:>8.1f}")
     return results
 
 
@@ -251,6 +269,19 @@ def main():
                        default="results/theory/downstream_amazon.json")
     args = parser.parse_args()
 
+    log_path = Path(args.output).with_suffix(".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w"),
+            logging.StreamHandler(),
+        ],
+    )
+    log = logging.getLogger(__name__)
+    log.info("Starting Amazon downstream experiment")
+
     X_old, X_new, pairs_old, pairs_new, n_users, n_items = load_amazon()
     results = run_experiment(X_old, X_new, pairs_old, pairs_new,
                             n_users, n_items, seeds=args.seeds)
@@ -258,7 +289,7 @@ def main():
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({"amazon": results}, f, indent=2)
-    print(f"\nSaved to {args.output}")
+    log.info(f"Saved to {args.output}")
 
 
 if __name__ == "__main__":

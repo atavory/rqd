@@ -187,11 +187,13 @@ def warm_retrain(
     freeze_depth: int | None = None,
     n_iter: int = 20,
     seed: int = 42,
+    spectral: bool = False,
+    rq_source: RQCodebook | None = None,
 ) -> RQCodebook:
     """Warm-retrain suffix stages on shifted data.
 
     Freezes stages 1..freeze_depth, warm-retrains the rest using old
-    centroids as initialization.
+    centroids as initialization (default) or spectral initialization.
 
     Args:
         rq: Trained RQ codebook (not modified).
@@ -200,6 +202,11 @@ def warm_retrain(
             Default: floor(M/2).
         n_iter: K-means iterations for retraining.
         seed: Random seed.
+        spectral: If True, initialize the first suffix stage from the
+            leading principal components of the drift residual instead
+            of warm-starting from old centroids.
+        rq_source: Source-period codebook for computing drift residuals.
+            Required when spectral=True. If None, uses rq.
 
     Returns:
         New RQCodebook with frozen prefix and retrained suffix.
@@ -216,7 +223,44 @@ def warm_retrain(
         residual = residual - rq_new.codebooks[m][assignments]
 
     rng = np.random.RandomState(seed)
-    for m in range(freeze_depth, rq.n_stages):
+
+    if spectral and freeze_depth < rq.n_stages:
+        src = rq_source if rq_source is not None else rq
+        source_residual = src.get_residual(X_new, n_stages=freeze_depth)
+        drift = residual - source_residual
+        K_first = rq.codes_per_stage[freeze_depth]
+        mean_res = residual.mean(axis=0)
+        centered = residual - mean_res
+        _, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        explained = np.cumsum(S**2) / max(np.sum(S**2), 1e-12)
+        r = int(np.searchsorted(explained, 0.9)) + 1
+        r = min(r, Vt.shape[0])
+        projections = centered @ Vt[:r].T
+        spectral_init = np.zeros(
+            (K_first, residual.shape[1]), dtype=np.float32
+        )
+        for j in range(min(r, K_first)):
+            lo = np.percentile(projections[:, j % r], 100 * j / K_first)
+            hi = np.percentile(projections[:, j % r], 100 * (j + 1) / K_first)
+            mask = (projections[:, j % r] >= lo) & (projections[:, j % r] < hi)
+            if mask.sum() > 0:
+                spectral_init[j] = residual[mask].mean(axis=0)
+            else:
+                spectral_init[j] = residual[rng.randint(len(residual))]
+        for j in range(min(r, K_first), K_first):
+            spectral_init[j] = residual[rng.randint(len(residual))]
+        centroids = _kmeans(
+            residual, K_first, n_iter=n_iter, rng=rng,
+            init=spectral_init,
+        )
+        rq_new.codebooks[freeze_depth] = centroids
+        assignments = _assign(residual, centroids)
+        residual = residual - centroids[assignments]
+        start = freeze_depth + 1
+    else:
+        start = freeze_depth
+
+    for m in range(start, rq.n_stages):
         centroids = _kmeans(
             residual,
             rq.codes_per_stage[m],
