@@ -99,13 +99,20 @@ def main():
     p.add_argument("--n-samples", type=int, default=30000)
     p.add_argument("--d-raw", type=int, default=256)
     p.add_argument("--d-embed", type=int, default=128)
+    p.add_argument("--dims", type=str, default=None,
+                   help="Comma-separated d-embed values to sweep, e.g. 128,256,512")
     p.add_argument("--json-output", type=str, default="embedding_retrain.json")
     args = p.parse_args()
+
+    embed_dims = [int(d) for d in args.dims.split(",")] if args.dims else [args.d_embed]
 
     t0 = time.time()
     results = []
 
-    for seed in range(args.seeds):
+    for d_embed in embed_dims:
+      args.d_embed = d_embed
+      log.info(f"=== d_embed={d_embed} ===")
+      for seed in range(args.seeds):
         log.info(f"seed={seed}")
         rng = np.random.RandomState(seed)
 
@@ -158,6 +165,7 @@ def main():
                     return 1.0 - (mw - mfull)/d if abs(d)>1e-12 else 1.0
 
                 results.append({
+                    "d_embed": d_embed,
                     "seed": seed, "arch": aname, "period": period,
                     "mse_frozen_raw": mse_frozen,
                     "mse_frozen_aligned": mse_frozen_aligned,
