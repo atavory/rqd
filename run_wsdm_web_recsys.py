@@ -15,6 +15,7 @@ JSON artifact and should be invoked with a unique --output path.
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import json
 import math
@@ -139,21 +140,39 @@ def _prepare_movielens(cache_path: Path, emb_dim: int) -> dict:
 
 
 def _load_amazon_arrays(data_path: Path, core_passes: int):
-    """Read Amazon-2018 with an optional synchronous degree-20 filter."""
+    """Read Amazon 2018 JSONL.gz or Amazon 2023 five-core CSV."""
     user_map, item_map = {}, {}
     users, items = array("I"), array("I")
     ratings, timestamps = array("f"), array("q")
-    with gzip.open(data_path, "rt") as f:
-        for line_no, line in enumerate(f, 1):
-            row = json.loads(line)
-            user = row["reviewerID"]
-            item = row["asin"]
+
+    if data_path.suffix == ".csv":
+        source = data_path.open("r", newline="")
+        rows = csv.DictReader(source)
+
+        def fields(row):
+            return (
+                row["user_id"], row["parent_asin"],
+                float(row["rating"]), int(row["timestamp"]),
+            )
+    else:
+        source = gzip.open(data_path, "rt")
+        rows = (json.loads(line) for line in source)
+
+        def fields(row):
+            return (
+                row["reviewerID"], row["asin"],
+                float(row["overall"]), int(row["unixReviewTime"]),
+            )
+
+    with source:
+        for line_no, row in enumerate(rows, 1):
+            user, item, rating, timestamp = fields(row)
             u = user_map.setdefault(user, len(user_map))
             i = item_map.setdefault(item, len(item_map))
             users.append(u)
             items.append(i)
-            ratings.append(float(row["overall"]))
-            timestamps.append(int(row["unixReviewTime"]))
+            ratings.append(rating)
+            timestamps.append(timestamp)
             if line_no % 1_000_000 == 0:
                 print(f"  parsed {line_no:,} Amazon reviews", flush=True)
 
@@ -237,13 +256,20 @@ def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int,
     eval_t1 = _sample_sequences(
         eval_t1, max_eval_sequences, sequence_sample_seed + 1,
     )
+    source_release = (
+        "Amazon Reviews 2023 five-core rating-only benchmark"
+        if data_path.suffix == ".csv" else
+        "Amazon Reviews 2018 five-core category file"
+    )
     filtering = (
-        "public Electronics 5-core file with no additional filtering"
+        f"public {source_release} with no additional filtering"
         if core_passes == 0 else
         f"{core_passes} synchronous user/item degree-20 filtering passes"
     )
     metadata = {
         "dataset": "amazon",
+        "dataset_variant": data_path.stem,
+        "source_release": source_release,
         "source": str(data_path),
         "n_users": n_users,
         "n_items": n_items,
@@ -311,6 +337,56 @@ def _codebook_bytes(rq: RQ, stages=None) -> int:
     if stages is None:
         stages = range(rq.m)
     return int(sum(rq.cb[s].nbytes for s in stages))
+
+
+def _prefix_bucket_metrics(rq: RQ, embeddings, freeze_depth: int) -> dict:
+    """Summarize the full catalog partition induced by a prefix."""
+    codes = rq.encode(embeddings)[:, :freeze_depth]
+    packed = np.zeros(len(codes), dtype=np.uint64)
+    for stage in range(freeze_depth):
+        packed = packed * np.uint64(rq.K[stage]) + codes[:, stage].astype(
+            np.uint64
+        )
+    _, counts = np.unique(packed, return_counts=True)
+    probabilities = counts.astype(np.float64) / max(len(codes), 1)
+    entropy = float(-np.sum(probabilities * np.log2(probabilities)))
+    return {
+        "occupied_prefixes": int(len(counts)),
+        "possible_prefixes": int(np.prod(rq.K[:freeze_depth])),
+        "prefix_occupancy_fraction": float(
+            len(counts) / max(int(np.prod(rq.K[:freeze_depth])), 1)
+        ),
+        "items_per_prefix_mean": float(counts.mean()),
+        "items_per_prefix_p50": float(np.percentile(counts, 50)),
+        "items_per_prefix_p95": float(np.percentile(counts, 95)),
+        "items_per_prefix_max": int(counts.max()),
+        "prefix_entropy_bits": entropy,
+        "effective_prefixes": float(2.0 ** entropy),
+    }
+
+
+def _index_strategy_metrics(name, rq, embeddings, freeze_depth, churn,
+                            n_items: int, codebook_update_bytes: int) -> dict:
+    mse = rq.mse(embeddings)
+    energy = float(np.mean(np.sum(embeddings ** 2, axis=1)))
+    return {
+        "strategy": name,
+        "mse": mse,
+        "normalized_mse": float(mse / max(energy, 1e-12)),
+        "prefix_churn": churn["raw"],
+        "prefix_churn_raw": churn["raw"],
+        "prefix_churn_centroid_aligned": churn["centroid_aligned"],
+        "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+        "items_reindexed": int(round(churn["raw"] * n_items)),
+        "items_reindexed_centroid_aligned": int(round(
+            churn["centroid_aligned"] * n_items
+        )),
+        "items_reindexed_assignment_aligned": int(round(
+            churn["assignment_aligned"] * n_items
+        )),
+        "codebook_update_bytes": codebook_update_bytes,
+        **_prefix_bucket_metrics(rq, embeddings, freeze_depth),
+    }
 
 
 def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
@@ -411,7 +487,10 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             history = histories[start + local]
             query = embeddings[history[-3:]].mean(axis=0)
             distances = np.sum((item_decoded[candidates] - query) ** 2, axis=1)
-            ranking = candidates[np.argsort(distances)]
+            top_count = min(200, len(candidates))
+            top = np.argpartition(distances, top_count - 1)[:top_count]
+            top = top[np.argsort(distances[top])]
+            ranking = candidates[top]
             for cutoff in recalls:
                 hit = target in ranking[:cutoff]
                 recalls[cutoff] += int(hit)
@@ -512,6 +591,42 @@ def run_seed(args) -> None:
         rq_source, rq_full, embeddings_t1, freeze_depth,
     )
 
+    zero_churn = {"raw": 0.0, "centroid_aligned": 0.0,
+                  "assignment_aligned": 0.0}
+    if args.index_only:
+        payload["configuration"]["mode"] = "full_catalog_index_only"
+        payload["strategies"] = [
+            _index_strategy_metrics(
+                "frozen", rq_source, embeddings_t1, freeze_depth,
+                zero_churn, n_items, 0,
+            ),
+            _index_strategy_metrics(
+                "stratified", rq_stratified, embeddings_t1, freeze_depth,
+                zero_churn, n_items,
+                _codebook_bytes(rq_stratified, range(freeze_depth, 4)),
+            ),
+            _index_strategy_metrics(
+                "full_retrained", rq_full, embeddings_t1, freeze_depth,
+                full_churn, n_items, _codebook_bytes(rq_full),
+            ),
+        ]
+        frozen_mse, stratified_mse, full_mse = (
+            row["mse"] for row in payload["strategies"]
+        )
+        payload["summary"] = {
+            "stratified_gap_recovery": float(
+                (frozen_mse - stratified_mse)
+                / max(frozen_mse - full_mse, 1e-12)
+            ),
+        }
+        payload["timing"]["total_seconds"] = sum(
+            value for value in payload["timing"].values()
+            if isinstance(value, float)
+        )
+        _write_json(output, payload)
+        print(json.dumps(payload, indent=2, default=_json_default), flush=True)
+        return
+
     source_codes = rq_source.encode(embeddings_t0)
     tok_t0, stg_t0 = prefix_seqs(seqs_t0, source_codes, freeze_depth)
     torch.manual_seed(seed)
@@ -525,8 +640,6 @@ def run_seed(args) -> None:
     )
     payload["timing"]["source_generator_seconds"] = time.perf_counter() - started
 
-    zero_churn = {"raw": 0.0, "centroid_aligned": 0.0,
-                  "assignment_aligned": 0.0}
     strategies = [
         ("frozen", source_model, rq_source, rq_source, zero_churn, False),
         ("stratified", source_model, rq_source, rq_stratified, zero_churn, False),
@@ -680,6 +793,13 @@ def parse_args():
         help="Optional comma-separated additional beam counts evaluated using the same models",
     )
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--index-only", action="store_true",
+        help=(
+            "Run full-catalog quantization, aligned churn, and prefix-bucket "
+            "statistics without training or evaluating a prefix consumer"
+        ),
+    )
     parser.add_argument(
         "--skip-rebuilt-consumer",
         action="store_true",

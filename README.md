@@ -15,7 +15,8 @@ is required.
 ## Corrected web-recommender suite
 
 `run_wsdm_web_recsys.py` is the public runner for the paper's focused temporal
-experiments on MovieLens-1M and Amazon Electronics. It provides:
+experiments on MovieLens-1M, Amazon Reviews 2018, and the Amazon Reviews 2023
+five-core benchmark. It provides:
 
 - deterministic temporal data preparation and immutable numeric caches;
 - funnel and matched-bit uniform residual quantizers;
@@ -27,6 +28,8 @@ experiments on MovieLens-1M and Amazon Electronics. It provides:
 - raw token churn together with centroid-Hungarian and assignment-optimal
   label-aligned churn, so arbitrary k-means token permutations are not
   mistaken for genuine interface changes.
+- an `--index-only` mode for full-catalog reconstruction, aligned churn, and
+  prefix-bucket statistics without the much smaller sampled consumer workload.
 
 Variable-length histories are trained in exact-length batches, so padding never
 enters the model or loss. MovieLens uses shared-basis alignment plus global RMS
@@ -54,6 +57,33 @@ python3 run_wsdm_web_recsys.py \
   --cache data/amazon_full5core.npz \
   --prepare-only --embedding-dim 64
 ```
+
+Amazon Reviews 2023 `benchmark/5core/rating_only/*.csv` files use the same
+Amazon loader. For example:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset amazon \
+  --amazon-data data/amazon2023/Books.csv \
+  --amazon-core-passes 0 \
+  --max-train-sequences 50000 --max-eval-sequences 2000 \
+  --cache data/amazon2023_books.npz \
+  --prepare-only --embedding-dim 64
+```
+
+Run the full catalog without training a downstream generator:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset amazon --cache data/amazon2023_books.npz \
+  --arch funnel24 --freeze-depth 2 --seed 0 --index-only \
+  --output results/amazon2023_books_funnel24_fd2_seed0.json
+```
+
+The index-only artifact contains normalized and absolute MSE, gap recovery,
+all three churn conventions, update bytes, occupied-prefix counts, bucket-size
+quantiles, and effective prefix count. Consumer results remain a separate
+sampled evaluation and must report their sequence counts.
 
 Run one independently reproducible seed:
 
