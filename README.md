@@ -85,6 +85,16 @@ all three churn conventions, update bytes, occupied-prefix counts, bucket-size
 quantiles, and effective prefix count. Consumer results remain a separate
 sampled evaluation and must report their sequence counts.
 
+For the primary multi-seed study, reuse the same source/full endpoints across
+all freeze depths:
+
+```bash
+python3 run_wsdm_index_sweep.py \
+  --cache data/amazon2023_books.npz --arch funnel24 --seed 0 \
+  --freeze-depths 1,2,3 \
+  --output results/amazon2023_books_funnel24_seed0.json
+```
+
 Run one independently reproducible seed:
 
 ```bash
