@@ -108,6 +108,14 @@ def load_movielens_shared_basis(emb_dim=64, min_seq_len=5, max_seq_len=15):
 
 
 # === RQ ===
+def _sq_dists(X, c):
+    """Pairwise squared distances without materializing an N x K x d tensor."""
+    d = np.sum(X * X, axis=1, keepdims=True)
+    d = d + np.sum(c * c, axis=1)[None, :]
+    d = d - 2.0 * (X @ c.T)
+    return np.maximum(d, 0.0)
+
+
 def _kmeans(X, k, n_iter=20, rng=None, init=None):
     if rng is None: rng = np.random.RandomState(42)
     n = len(X)
@@ -116,18 +124,18 @@ def _kmeans(X, k, n_iter=20, rng=None, init=None):
         centroids = np.zeros((k, X.shape[1]), dtype=np.float32)
         centroids[0] = X[rng.randint(n)]
         for i in range(1, k):
-            d = np.min(np.sum((X[:, None, :] - centroids[None, :i, :]) ** 2, axis=2), axis=1)
+            d = np.min(_sq_dists(X, centroids[:i]), axis=1)
             t = d.sum()
             centroids[i] = X[rng.choice(n, p=d / max(t, 1e-12))] if t > 1e-12 else X[rng.randint(n)]
     for _ in range(n_iter):
-        a = np.argmin(np.sum((X[:, None, :] - centroids[None, :, :]) ** 2, axis=2), axis=1)
+        a = np.argmin(_sq_dists(X, centroids), axis=1)
         for j in range(k):
             m = a == j
             if m.sum() > 0: centroids[j] = X[m].mean(axis=0)
     return centroids
 
 def _assign(X, c):
-    return np.argmin(np.sum((X[:, None, :] - c[None, :, :]) ** 2, axis=2), axis=1).astype(np.int64)
+    return np.argmin(_sq_dists(X, c), axis=1).astype(np.int64)
 
 class RQ:
     def __init__(self, m, codes, dim):
@@ -182,7 +190,7 @@ class PrefixGenerator(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.heads = nn.ModuleList([nn.Linear(d_model, vs) for vs in vocab_sizes_prefix])
 
-    def forward(self, token_ids, stage_ids):
+    def forward(self, token_ids, stage_ids, padding_mask=None):
         B, T = token_ids.shape
         embs = torch.zeros(B, T, self.d_model, device=token_ids.device)
         for s in range(self.n_prefix):
@@ -191,14 +199,22 @@ class PrefixGenerator(nn.Module):
         pos = torch.arange(T, device=token_ids.device).unsqueeze(0)
         embs = embs + self.pos_emb(pos) + self.stage_emb(stage_ids)
         causal = torch.triu(torch.ones(T, T, device=token_ids.device), diagonal=1).bool()
-        return self.transformer(embs, mask=causal)
+        return self.transformer(
+            embs, mask=causal, src_key_padding_mask=padding_mask,
+        )
 
     @torch.no_grad()
-    def generate_prefixes(self, token_ids, stage_ids, n_beams=10):
+    def generate_prefixes(self, token_ids, stage_ids, n_beams=10,
+                          padding_mask=None):
         B = token_ids.shape[0]; device = token_ids.device
         all_prefixes, all_scores = [], []
         for b in range(B):
-            ctx_tok = token_ids[b:b+1]; ctx_stg = stage_ids[b:b+1]
+            if padding_mask is None:
+                context_length = token_ids.shape[1]
+            else:
+                context_length = int((~padding_mask[b]).sum().item())
+            ctx_tok = token_ids[b:b+1, :context_length]
+            ctx_stg = stage_ids[b:b+1, :context_length]
             beams = [([], 0.0)]
             for s in range(self.n_prefix):
                 new_beams = []
@@ -250,16 +266,23 @@ def train_prefix_gen(model, token_ids, stage_ids, fd,
     max_len = max(len(t) for t in token_ids)
     tok = torch.from_numpy(pad(token_ids, max_len)).long().to(device)
     stg = torch.from_numpy(pad(stage_ids, max_len)).long().to(device)
+    length_groups = {}
+    for row, tokens in enumerate(token_ids):
+        length_groups.setdefault(len(tokens), []).append(row)
     model = model.to(device).train()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
-    n = len(token_ids)
     for _ in range(epochs):
-        perm = torch.randperm(n)
-        for i in range(0, n, batch_size):
-            idx = perm[i:i + batch_size]
-            bt, bs = tok[idx, :-1], stg[idx, :-1]
-            tt, ts = tok[idx, 1:], stg[idx, 1:]
+        batches = []
+        for length in sorted(length_groups):
+            rows = torch.tensor(length_groups[length], dtype=torch.long)
+            rows = rows[torch.randperm(len(rows))]
+            for i in range(0, len(rows), batch_size):
+                batches.append((length, rows[i:i + batch_size]))
+        for batch_index in torch.randperm(len(batches)).tolist():
+            length, idx = batches[batch_index]
+            bt, bs = tok[idx, :length - 1], stg[idx, :length - 1]
+            tt, ts = tok[idx, 1:length], stg[idx, 1:length]
             out = model(bt, bs)
             loss = sum(
                 F.cross_entropy(model.heads[s](out[ts == s]), tt[ts == s])
@@ -275,11 +298,18 @@ def train_prefix_gen(model, token_ids, stage_ids, fd,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seeds", type=int, default=5)
+    p.add_argument("--seed-start", type=int, default=0,
+                   help="First seed to run; use with --seeds 1 for isolated runs")
+    p.add_argument("--config-index", type=int, default=None,
+                   help="Run only one zero-based entry from the configuration list")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--n-beams", type=int, default=10)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--json-output", type=str, default="generative_prefix.json")
     args = p.parse_args()
+    if args.seeds != 1:
+        p.error("run one seed at a time with --seeds 1 and --seed-start; "
+                "the released multi-seed loop evaluates only its final seed")
 
     t0 = time.time()
     results = []
@@ -297,6 +327,10 @@ def main():
         (8, 6, [16, 16, 16, 16, 16, 16, 32, 32]),
         (8, 7, [16, 16, 16, 16, 16, 16, 16, 32]),
     ]
+    if args.config_index is not None:
+        if not 0 <= args.config_index < len(configs):
+            p.error(f"--config-index must be in [0, {len(configs) - 1}]")
+        configs = [configs[args.config_index]]
 
     embs_t0, embs_t1, seqs_t0, eval_t1, seen_t0, n_users, n_items = \
         load_movielens_shared_basis()
@@ -307,7 +341,7 @@ def main():
         prefix_codes = codes_list[:fd]
         log.info(f"=== m={m}, freeze_depth={fd}, arch={codes_list} ===")
 
-        for seed in range(args.seeds):
+        for seed in range(args.seed_start, args.seed_start + args.seeds):
             log.info(f"  seed={seed}")
 
             rq_src = RQ(m, codes_list, emb_dim).fit(embs_t0, seed=seed)

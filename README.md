@@ -1,6 +1,7 @@
-# Stable Semantic IDs under Distribution Shift
+# Semantic IDs as Interfaces Under Distribution Shift
 
-Code for "Stable Semantic IDs under Distribution Shift" (CIKM 2026 submission).
+Public experiment code for maintaining semantic-ID interfaces as embedding
+models and interaction logs evolve.
 
 ## Setup
 
@@ -8,7 +9,50 @@ Code for "Stable Semantic IDs under Distribution Shift" (CIKM 2026 submission).
 pip install -r requirements.txt
 ```
 
-Requires only `numpy` and `scipy`. No GPU needed.
+The corrected web-recommender experiments additionally use CPU PyTorch. No GPU
+is required.
+
+## Corrected web-recommender suite
+
+`run_wsdm_web_recsys.py` is the public runner for the paper's focused temporal
+experiments on MovieLens-1M and Amazon Electronics. It provides:
+
+- deterministic temporal data preparation and immutable numeric caches;
+- funnel and matched-bit uniform residual quantizers;
+- freeze-depth and beam-count sweeps;
+- frozen, suffix-adapted, full-retrain/old-consumer, and
+  full-retrain/rebuilt-consumer strategies;
+- recall, routing coverage, candidate work, MSE, prefix churn, reindex counts,
+  and codebook-update size in one JSON artifact per seed.
+
+Variable-length histories are trained in exact-length batches, so padding never
+enters the model or loss. MovieLens uses shared-basis alignment plus global RMS
+calibration; Amazon uses independent SVD plus orthogonal Procrustes alignment.
+
+Prepare a cache:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset movielens \
+  --cache data/movielens_scaled.npz \
+  --prepare-only --embedding-dim 64
+```
+
+Run one independently reproducible seed:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset movielens \
+  --cache data/movielens_scaled.npz \
+  --arch funnel24 --freeze-depth 2 --seed 0 \
+  --epochs 50 --n-beams 10 --beam-values 1,5,10 \
+  --output results/movielens_funnel24_fd2_seed0.json
+```
+
+The companion data artifact is the canonical source for dataset URLs and
+hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
+and table-to-artifact mappings. The paper does not consume uncommitted or
+locally aggregated results.
 
 ## Library
 
