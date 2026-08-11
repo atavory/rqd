@@ -256,11 +256,15 @@ def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int,
     eval_t1 = _sample_sequences(
         eval_t1, max_eval_sequences, sequence_sample_seed + 1,
     )
-    source_release = (
-        "Amazon Reviews 2023 five-core rating-only benchmark"
-        if data_path.suffix == ".csv" else
-        "Amazon Reviews 2018 five-core category file"
-    )
+    if data_path.suffix == ".csv":
+        benchmark_core = (
+            "zero-core" if "0core" in data_path.stem.lower() else "five-core"
+        )
+        source_release = (
+            f"Amazon Reviews 2023 {benchmark_core} rating-only benchmark"
+        )
+    else:
+        source_release = "Amazon Reviews 2018 five-core category file"
     filtering = (
         f"public {source_release} with no additional filtering"
         if core_passes == 0 else
