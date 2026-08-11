@@ -390,7 +390,7 @@ def _index_strategy_metrics(name, rq, embeddings, freeze_depth, churn,
 
 
 def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
-                          freeze_depth: int) -> dict:
+                          freeze_depth: int, return_mappings: bool = False):
     """Measure raw churn and the part not removable by token relabeling.
 
     Independent k-means fits assign arbitrary integer labels to otherwise
@@ -409,6 +409,8 @@ def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
     current = rq_new.encode(embeddings)[:, :freeze_depth]
     centroid_aligned = current.copy()
     assignment_aligned = current.copy()
+    centroid_mappings = []
+    assignment_mappings = []
 
     for stage in range(freeze_depth):
         k = rq_src.K[stage]
@@ -422,6 +424,7 @@ def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
         source_rows, current_cols = linear_sum_assignment(centroid_cost)
         current_to_source = np.empty(k, dtype=np.int64)
         current_to_source[current_cols] = source_rows
+        centroid_mappings.append(current_to_source.copy())
         centroid_aligned[:, stage] = current_to_source[current[:, stage]]
 
         overlap = np.zeros((k, k), dtype=np.int64)
@@ -429,9 +432,10 @@ def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
         source_rows, current_cols = linear_sum_assignment(-overlap)
         current_to_source = np.empty(k, dtype=np.int64)
         current_to_source[current_cols] = source_rows
+        assignment_mappings.append(current_to_source.copy())
         assignment_aligned[:, stage] = current_to_source[current[:, stage]]
 
-    return {
+    metrics = {
         "raw": float(np.any(source != current, axis=1).mean()),
         "centroid_aligned": float(
             np.any(source != centroid_aligned, axis=1).mean()
@@ -440,16 +444,32 @@ def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
             np.any(source != assignment_aligned, axis=1).mean()
         ),
     }
+    if return_mappings:
+        return metrics, {
+            "centroid_hungarian": centroid_mappings,
+            "assignment_optimal": assignment_mappings,
+        }
+    return metrics
+
+
+def _apply_prefix_mapping(codes, mappings):
+    mapped = codes.copy()
+    if mappings is not None:
+        for stage, current_to_source in enumerate(mappings):
+            mapped[:, stage] = current_to_source[mapped[:, stage]]
+    return mapped
 
 
 @torch.no_grad()
 def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
-                            freeze_depth, n_beams, device):
+                            freeze_depth, n_beams, device,
+                            item_prefix_mapping=None):
     histories = [history for _, history, _ in eval_t1]
     targets = [target for _, _, target in eval_t1]
     history_codes = history_rq.encode(embeddings)
-    item_codes = item_rq.encode(embeddings)
-    item_decoded = item_rq.decode_codes(item_codes)
+    item_codes_raw = item_rq.encode(embeddings)
+    item_decoded = item_rq.decode_codes(item_codes_raw)
+    item_codes = _apply_prefix_mapping(item_codes_raw, item_prefix_mapping)
 
     prefix_to_items = {}
     for item_id, row in enumerate(item_codes[:, :freeze_depth]):
@@ -517,13 +537,14 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
 
 
 def evaluate_beam_sweep(model, eval_t1, history_rq, item_rq, embeddings,
-                        freeze_depth, beam_values, device, strategy):
+                        freeze_depth, beam_values, device, strategy,
+                        item_prefix_mapping=None):
     rows = []
     for n_beams in beam_values:
         print(f"evaluating {strategy} with {n_beams} beams", flush=True)
         metrics = evaluate_prefix_routing(
             model, eval_t1, history_rq, item_rq, embeddings,
-            freeze_depth, n_beams, device,
+            freeze_depth, n_beams, device, item_prefix_mapping,
         )
         metrics.update({"strategy": strategy, "n_beams": n_beams})
         rows.append(metrics)
@@ -544,7 +565,7 @@ def run_seed(args) -> None:
     n_items = len(embeddings_t0)
 
     payload = {
-        "schema_version": 2 if args.beam_values else 1,
+        "schema_version": 3,
         "dataset": metadata,
         "configuration": {
             "arch": args.arch,
@@ -587,8 +608,9 @@ def run_seed(args) -> None:
         embeddings_t1, seed=seed + 500,
     )
     payload["timing"]["full_codebook_seconds"] = time.perf_counter() - started
-    full_churn = _prefix_churn_metrics(
+    full_churn, full_mappings = _prefix_churn_metrics(
         rq_source, rq_full, embeddings_t1, freeze_depth,
+        return_mappings=True,
     )
 
     zero_churn = {"raw": 0.0, "centroid_aligned": 0.0,
@@ -641,18 +663,35 @@ def run_seed(args) -> None:
     payload["timing"]["source_generator_seconds"] = time.perf_counter() - started
 
     strategies = [
-        ("frozen", source_model, rq_source, rq_source, zero_churn, False),
-        ("stratified", source_model, rq_source, rq_stratified, zero_churn, False),
+        (
+            "frozen", source_model, rq_source, rq_source, zero_churn, False,
+            None, "none",
+        ),
+        (
+            "stratified", source_model, rq_source, rq_stratified, zero_churn,
+            False, None, "none",
+        ),
         (
             "full_old_generator", source_model, rq_source, rq_full,
-            full_churn, False,
+            full_churn, False, None, "none",
+        ),
+        (
+            "full_old_generator_centroid_relabel", source_model, rq_source,
+            rq_full, full_churn, False,
+            full_mappings["centroid_hungarian"], "centroid_hungarian",
+        ),
+        (
+            "full_old_generator_assignment_relabel", source_model, rq_source,
+            rq_full, full_churn, False,
+            full_mappings["assignment_optimal"], "assignment_optimal",
         ),
     ]
-    for name, model, history_rq, item_rq, churn, retrained in strategies:
+    for (name, model, history_rq, item_rq, churn, retrained,
+         item_prefix_mapping, relabeling) in strategies:
         print(f"evaluating {name}", flush=True)
         metrics = evaluate_prefix_routing(
             model, eval_t1, history_rq, item_rq, embeddings_t1,
-            freeze_depth, args.n_beams, args.device,
+            freeze_depth, args.n_beams, args.device, item_prefix_mapping,
         )
         metrics.update({
             "strategy": name,
@@ -671,6 +710,10 @@ def run_seed(args) -> None:
                 churn["assignment_aligned"] * n_items
             )),
             "consumer_retrained": retrained,
+            "consumer_token_relabeling": relabeling,
+            "token_relabeling_bytes": int(sum(
+                mapping.nbytes for mapping in (item_prefix_mapping or [])
+            )),
             "codebook_update_bytes": (
                 0 if name == "frozen" else
                 _codebook_bytes(item_rq, range(freeze_depth, 4))
@@ -682,7 +725,7 @@ def run_seed(args) -> None:
             model, eval_t1, history_rq, item_rq, embeddings_t1,
             freeze_depth,
             [value for value in args.beam_values if value != args.n_beams],
-            args.device, name,
+            args.device, name, item_prefix_mapping,
         ))
         _write_json(output, payload)
 
@@ -739,6 +782,8 @@ def run_seed(args) -> None:
             churn["assignment_aligned"] * n_items
         )),
         "consumer_retrained": True,
+        "consumer_token_relabeling": "none",
+        "token_relabeling_bytes": 0,
         "codebook_update_bytes": _codebook_bytes(rq_full),
     })
     payload["strategies"].append(metrics)

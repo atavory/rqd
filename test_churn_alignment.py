@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from run_generative_prefix import RQ
-from run_wsdm_web_recsys import _prefix_churn_metrics
+from run_wsdm_web_recsys import _apply_prefix_mapping, _prefix_churn_metrics
 
 
 class ChurnAlignmentTest(unittest.TestCase):
@@ -17,11 +17,20 @@ class ChurnAlignmentTest(unittest.TestCase):
         source.cb = [np.asarray([[0.0], [10.0]], dtype=np.float32)]
         current.cb = [np.asarray([[10.0], [0.0]], dtype=np.float32)]
 
-        churn = _prefix_churn_metrics(source, current, embeddings, 1)
+        churn, mappings = _prefix_churn_metrics(
+            source, current, embeddings, 1, return_mappings=True,
+        )
 
         self.assertEqual(churn["raw"], 1.0)
         self.assertEqual(churn["centroid_aligned"], 0.0)
         self.assertEqual(churn["assignment_aligned"], 0.0)
+        source_codes = source.encode(embeddings)
+        current_codes = current.encode(embeddings)
+        for mapping in mappings.values():
+            np.testing.assert_array_equal(
+                source_codes,
+                _apply_prefix_mapping(current_codes, mapping),
+            )
 
 
 if __name__ == "__main__":

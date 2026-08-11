@@ -23,6 +23,8 @@ five-core benchmark. It provides:
 - freeze-depth and beam-count sweeps;
 - frozen, suffix-adapted, full-retrain/old-consumer, and
   full-retrain/rebuilt-consumer strategies;
+- centroid-Hungarian and assignment-optimal global relabeling baselines for
+  the old consumer, testing whether token permutation alone explains failure;
 - recall, routing coverage, candidate work, MSE, prefix churn, reindex counts,
   and codebook-update size in one JSON artifact per seed;
 - raw token churn together with centroid-Hungarian and assignment-optimal
@@ -125,6 +127,11 @@ Every full-retrain result therefore records three conventions:
 
 Raw churn alone is diagnostic and must not be reported as evidence of a
 vocabulary migration without the aligned controls.
+
+The downstream runner also evaluates the unchanged old consumer against the
+fully retrained catalog after applying each global mapping to the retrained
+prefix tokens. If either baseline restores routing, the failure is attributable
+to a removable label permutation rather than genuine interface reassignment.
 
 ## Library
 
