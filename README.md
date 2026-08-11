@@ -23,7 +23,10 @@ experiments on MovieLens-1M and Amazon Electronics. It provides:
 - frozen, suffix-adapted, full-retrain/old-consumer, and
   full-retrain/rebuilt-consumer strategies;
 - recall, routing coverage, candidate work, MSE, prefix churn, reindex counts,
-  and codebook-update size in one JSON artifact per seed.
+  and codebook-update size in one JSON artifact per seed;
+- raw token churn together with centroid-Hungarian and assignment-optimal
+  label-aligned churn, so arbitrary k-means token permutations are not
+  mistaken for genuine interface changes.
 
 Variable-length histories are trained in exact-length batches, so padding never
 enters the model or loss. MovieLens uses shared-basis alignment plus global RMS
@@ -35,6 +38,20 @@ Prepare a cache:
 python3 run_wsdm_web_recsys.py \
   --dataset movielens \
   --cache data/movielens_scaled.npz \
+  --prepare-only --embedding-dim 64
+```
+
+For the full Amazon Electronics 2018 5-core catalog, use zero additional
+degree-filtering passes. Sequence limits affect generator training/evaluation,
+not the interaction data used to construct the temporal embeddings:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset amazon \
+  --amazon-data data/amazon/Electronics_5.json.gz \
+  --amazon-core-passes 0 \
+  --max-train-sequences 50000 --max-eval-sequences 10000 \
+  --cache data/amazon_full5core.npz \
   --prepare-only --embedding-dim 64
 ```
 
@@ -53,6 +70,21 @@ The companion data artifact is the canonical source for dataset URLs and
 hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
 and table-to-artifact mappings. The paper does not consume uncommitted or
 locally aggregated results.
+
+### Churn interpretation
+
+Full retraining is an independent k-means++ fit (`seed + 500`), not a warm
+start from the source codebook. Its integer cluster labels are arbitrary.
+Every full-retrain result therefore records three conventions:
+
+- `prefix_churn_raw`: direct token inequality;
+- `prefix_churn_centroid_aligned`: a deployable global token permutation from
+  minimum-cost centroid matching;
+- `prefix_churn_assignment_aligned`: the maximum-agreement global permutation
+  on retained catalog items, providing a lower bound after relabeling.
+
+Raw churn alone is diagnostic and must not be reported as evidence of a
+vocabulary migration without the aligned controls.
 
 ## Library
 

@@ -123,10 +123,18 @@ def _kmeans(X, k, n_iter=20, rng=None, init=None):
     else:
         centroids = np.zeros((k, X.shape[1]), dtype=np.float32)
         centroids[0] = X[rng.randint(n)]
+        # Maintain the nearest selected-centroid distance incrementally.
+        # Recomputing distances to all i existing centroids at step i makes
+        # k-means++ initialization quadratic in k and dominates large catalogs.
+        nearest = _sq_dists(X, centroids[:1])[:, 0]
         for i in range(1, k):
-            d = np.min(_sq_dists(X, centroids[:i]), axis=1)
-            t = d.sum()
-            centroids[i] = X[rng.choice(n, p=d / max(t, 1e-12))] if t > 1e-12 else X[rng.randint(n)]
+            total = nearest.sum()
+            centroids[i] = (
+                X[rng.choice(n, p=nearest / max(total, 1e-12))]
+                if total > 1e-12 else X[rng.randint(n)]
+            )
+            new_distances = _sq_dists(X, centroids[i:i + 1])[:, 0]
+            nearest = np.minimum(nearest, new_distances)
     for _ in range(n_iter):
         a = np.argmin(_sq_dists(X, centroids), axis=1)
         for j in range(k):

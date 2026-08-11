@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.linalg import orthogonal_procrustes
+from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
 
@@ -137,8 +138,8 @@ def _prepare_movielens(cache_path: Path, emb_dim: int) -> dict:
     return metadata
 
 
-def _load_amazon_arrays(data_path: Path):
-    """Read Amazon-2018 and reproduce the historical 10-pass 20-core filter."""
+def _load_amazon_arrays(data_path: Path, core_passes: int):
+    """Read Amazon-2018 with an optional synchronous degree-20 filter."""
     user_map, item_map = {}, {}
     users, items = array("I"), array("I")
     ratings, timestamps = array("f"), array("q")
@@ -163,10 +164,10 @@ def _load_amazon_arrays(data_path: Path):
     del users, items, ratings, timestamps, user_map, item_map
 
     active = np.ones(len(u), dtype=bool)
-    # The May experiment used ten synchronous peeling passes. This is an
-    # approximate 20-core, not peeling to convergence: on this graph pass 10
-    # is the documented 74,095-review dataset, while convergence collapses it.
-    for iteration in range(10):
+    # The May experiment used ten synchronous peeling passes. Zero keeps the
+    # complete public Electronics 5-core category file for the scale study.
+    # Positive values are approximate 20-cores, not peeling to convergence.
+    for iteration in range(core_passes):
         uc = np.bincount(u[active], minlength=int(u.max()) + 1)
         ic = np.bincount(i[active], minlength=int(i.max()) + 1)
         updated = active & (uc[u] >= 20) & (ic[i] >= 20)
@@ -189,9 +190,19 @@ def _load_amazon_arrays(data_path: Path):
     )
 
 
-def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int) -> dict:
+def _sample_sequences(values, limit: int, seed: int):
+    if not limit or len(values) <= limit:
+        return values
+    rng = np.random.RandomState(seed)
+    selected = np.sort(rng.choice(len(values), size=limit, replace=False))
+    return [values[index] for index in selected]
+
+
+def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int,
+                    core_passes: int, max_train_sequences: int,
+                    max_eval_sequences: int, sequence_sample_seed: int) -> dict:
     user_ids, item_ids, ratings, timestamps, n_users, n_items = \
-        _load_amazon_arrays(data_path)
+        _load_amazon_arrays(data_path, core_passes)
     split_ts = int(np.median(timestamps))
     old_mask = timestamps < split_ts
     new_mask = ~old_mask
@@ -218,6 +229,19 @@ def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int) -> dict:
     seqs_t0, eval_t1 = _make_sequences(
         user_ids, item_ids, timestamps, split_ts,
     )
+    n_train_sequences_total = len(seqs_t0)
+    n_eval_sequences_total = len(eval_t1)
+    seqs_t0 = _sample_sequences(
+        seqs_t0, max_train_sequences, sequence_sample_seed,
+    )
+    eval_t1 = _sample_sequences(
+        eval_t1, max_eval_sequences, sequence_sample_seed + 1,
+    )
+    filtering = (
+        "public Electronics 5-core file with no additional filtering"
+        if core_passes == 0 else
+        f"{core_passes} synchronous user/item degree-20 filtering passes"
+    )
     metadata = {
         "dataset": "amazon",
         "source": str(data_path),
@@ -228,9 +252,14 @@ def _prepare_amazon(cache_path: Path, data_path: Path, emb_dim: int) -> dict:
         "n_new_interactions": int(new_mask.sum()),
         "n_train_sequences": len(seqs_t0),
         "n_eval_sequences": len(eval_t1),
+        "n_train_sequences_before_sampling": n_train_sequences_total,
+        "n_eval_sequences_before_sampling": n_eval_sequences_total,
+        "sequence_sample_seed": sequence_sample_seed,
+        "amazon_core_passes": core_passes,
         "embedding_dim": int(k),
         "split_timestamp": split_ts,
-        "split": "global median timestamp after historical 10-pass user/item 20-core filter",
+        "filtering": filtering,
+        "split": f"global median timestamp after {filtering}",
         "embedding_alignment": "independent SVD plus orthogonal Procrustes",
         "alignment_mse": alignment_mse,
     }
@@ -256,6 +285,8 @@ def prepare_dataset(args) -> None:
     else:
         metadata = _prepare_amazon(
             cache_path, Path(args.amazon_data), args.embedding_dim,
+            args.amazon_core_passes, args.max_train_sequences,
+            args.max_eval_sequences, args.sequence_sample_seed,
         )
     metadata["preparation_seconds"] = time.perf_counter() - started
     # Store the final timing next to the immutable numeric cache.
@@ -282,10 +313,57 @@ def _codebook_bytes(rq: RQ, stages=None) -> int:
     return int(sum(rq.cb[s].nbytes for s in stages))
 
 
-def _prefix_churn(rq_src: RQ, rq_new: RQ, embeddings, freeze_depth: int) -> float:
+def _prefix_churn_metrics(rq_src: RQ, rq_new: RQ, embeddings,
+                          freeze_depth: int) -> dict:
+    """Measure raw churn and the part not removable by token relabeling.
+
+    Independent k-means fits assign arbitrary integer labels to otherwise
+    equivalent clusters. Raw token inequality therefore mixes genuine item
+    reassignment with a removable permutation of the vocabulary. We report
+    two explicit controls:
+
+    * centroid-aligned churn uses a deployable global permutation obtained by
+      minimum-cost bipartite matching of source and target code vectors;
+    * assignment-aligned churn uses the permutation that maximizes agreement
+      on the retained catalog, and is a lower bound for any global relabeling.
+
+    Matching is stage-wise because each RQ stage has its own token namespace.
+    """
     source = rq_src.encode(embeddings)[:, :freeze_depth]
     current = rq_new.encode(embeddings)[:, :freeze_depth]
-    return float(np.any(source != current, axis=1).mean())
+    centroid_aligned = current.copy()
+    assignment_aligned = current.copy()
+
+    for stage in range(freeze_depth):
+        k = rq_src.K[stage]
+
+        source_centroids = rq_src.cb[stage]
+        current_centroids = rq_new.cb[stage]
+        centroid_cost = np.sum(
+            (source_centroids[:, None, :] - current_centroids[None, :, :]) ** 2,
+            axis=2,
+        )
+        source_rows, current_cols = linear_sum_assignment(centroid_cost)
+        current_to_source = np.empty(k, dtype=np.int64)
+        current_to_source[current_cols] = source_rows
+        centroid_aligned[:, stage] = current_to_source[current[:, stage]]
+
+        overlap = np.zeros((k, k), dtype=np.int64)
+        np.add.at(overlap, (source[:, stage], current[:, stage]), 1)
+        source_rows, current_cols = linear_sum_assignment(-overlap)
+        current_to_source = np.empty(k, dtype=np.int64)
+        current_to_source[current_cols] = source_rows
+        assignment_aligned[:, stage] = current_to_source[current[:, stage]]
+
+    return {
+        "raw": float(np.any(source != current, axis=1).mean()),
+        "centroid_aligned": float(
+            np.any(source != centroid_aligned, axis=1).mean()
+        ),
+        "assignment_aligned": float(
+            np.any(source != assignment_aligned, axis=1).mean()
+        ),
+    }
 
 
 @torch.no_grad()
@@ -401,6 +479,11 @@ def run_seed(args) -> None:
             "device": args.device,
             "capacity": int(np.prod(np.asarray(codes, dtype=np.int64))),
             "capacity_per_item": float(np.prod(np.asarray(codes, dtype=np.int64)) / n_items),
+            "source_codebook_initialization": "independent k-means++",
+            "source_codebook_seed": seed,
+            "full_codebook_initialization": "independent k-means++ (not warm-started)",
+            "full_codebook_seed": seed + 500,
+            "label_alignment_during_training": "none",
         },
         "timing": {},
         "strategies": [],
@@ -425,6 +508,9 @@ def run_seed(args) -> None:
         embeddings_t1, seed=seed + 500,
     )
     payload["timing"]["full_codebook_seconds"] = time.perf_counter() - started
+    full_churn = _prefix_churn_metrics(
+        rq_source, rq_full, embeddings_t1, freeze_depth,
+    )
 
     source_codes = rq_source.encode(embeddings_t0)
     tok_t0, stg_t0 = prefix_seqs(seqs_t0, source_codes, freeze_depth)
@@ -439,12 +525,14 @@ def run_seed(args) -> None:
     )
     payload["timing"]["source_generator_seconds"] = time.perf_counter() - started
 
+    zero_churn = {"raw": 0.0, "centroid_aligned": 0.0,
+                  "assignment_aligned": 0.0}
     strategies = [
-        ("frozen", source_model, rq_source, rq_source, 0.0, False),
-        ("stratified", source_model, rq_source, rq_stratified, 0.0, False),
+        ("frozen", source_model, rq_source, rq_source, zero_churn, False),
+        ("stratified", source_model, rq_source, rq_stratified, zero_churn, False),
         (
             "full_old_generator", source_model, rq_source, rq_full,
-            _prefix_churn(rq_source, rq_full, embeddings_t1, freeze_depth), False,
+            full_churn, False,
         ),
     ]
     for name, model, history_rq, item_rq, churn, retrained in strategies:
@@ -456,8 +544,19 @@ def run_seed(args) -> None:
         metrics.update({
             "strategy": name,
             "mse": item_rq.mse(embeddings_t1),
-            "prefix_churn": churn,
-            "items_reindexed": int(round(churn * n_items)),
+            # Keep prefix_churn/items_reindexed as raw aliases for artifact
+            # compatibility; papers must identify the alignment convention.
+            "prefix_churn": churn["raw"],
+            "prefix_churn_raw": churn["raw"],
+            "prefix_churn_centroid_aligned": churn["centroid_aligned"],
+            "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+            "items_reindexed": int(round(churn["raw"] * n_items)),
+            "items_reindexed_centroid_aligned": int(round(
+                churn["centroid_aligned"] * n_items
+            )),
+            "items_reindexed_assignment_aligned": int(round(
+                churn["assignment_aligned"] * n_items
+            )),
             "consumer_retrained": retrained,
             "codebook_update_bytes": (
                 0 if name == "frozen" else
@@ -507,7 +606,7 @@ def run_seed(args) -> None:
     payload["timing"]["target_generator_seconds"] = time.perf_counter() - started
     payload["timing"]["target_generator_training_sequences"] = len(tok_t1)
     print("evaluating full_retrained_generator", flush=True)
-    churn = _prefix_churn(rq_source, rq_full, embeddings_t1, freeze_depth)
+    churn = full_churn
     metrics = evaluate_prefix_routing(
         target_model, eval_t1, rq_full, rq_full, embeddings_t1,
         freeze_depth, args.n_beams, args.device,
@@ -515,8 +614,17 @@ def run_seed(args) -> None:
     metrics.update({
         "strategy": "full_retrained_generator",
         "mse": rq_full.mse(embeddings_t1),
-        "prefix_churn": churn,
-        "items_reindexed": int(round(churn * n_items)),
+        "prefix_churn": churn["raw"],
+        "prefix_churn_raw": churn["raw"],
+        "prefix_churn_centroid_aligned": churn["centroid_aligned"],
+        "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+        "items_reindexed": int(round(churn["raw"] * n_items)),
+        "items_reindexed_centroid_aligned": int(round(
+            churn["centroid_aligned"] * n_items
+        )),
+        "items_reindexed_assignment_aligned": int(round(
+            churn["assignment_aligned"] * n_items
+        )),
         "consumer_retrained": True,
         "codebook_update_bytes": _codebook_bytes(rq_full),
     })
@@ -545,6 +653,19 @@ def parse_args():
         default="data/amazon/Electronics_5.json.gz",
     )
     parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument(
+        "--amazon-core-passes", type=int, default=10,
+        help="Synchronous degree-20 filtering passes; 0 keeps the full public 5-core file",
+    )
+    parser.add_argument(
+        "--max-train-sequences", type=int, default=0,
+        help="Deterministic history sample after embedding preparation; 0 keeps all",
+    )
+    parser.add_argument(
+        "--max-eval-sequences", type=int, default=0,
+        help="Deterministic target-history sample; 0 keeps all",
+    )
+    parser.add_argument("--sequence-sample-seed", type=int, default=2026)
     parser.add_argument("--arch", choices=sorted(ARCHITECTURES))
     parser.add_argument("--seed", type=int)
     parser.add_argument("--epochs", type=int, default=50)
@@ -575,6 +696,10 @@ def parse_args():
         parser.error("--beam-values must be comma-separated positive integers")
     if any(value <= 0 for value in args.beam_values):
         parser.error("--beam-values must be comma-separated positive integers")
+    if args.amazon_core_passes < 0:
+        parser.error("--amazon-core-passes must be nonnegative")
+    if args.max_train_sequences < 0 or args.max_eval_sequences < 0:
+        parser.error("sequence limits must be nonnegative")
     if not args.prepare_only and (args.arch is None or args.seed is None or args.output is None):
         parser.error("seeded runs require --arch, --seed, and --output")
     return args
