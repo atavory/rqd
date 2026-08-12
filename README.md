@@ -238,6 +238,12 @@ OUT_ROOT=/data/users/atavory/scratch/wsdm_experiments/results/tier_c_retrain_pre
 The queue is restart-safe: complete valid JSONs are skipped, and logs live
 under `$OUT_ROOT/queue/logs/`.
 
+`run_wsdm_overnight_watchdog.sh` is the scratch-box watchdog used for long
+overnight runs. It checks the persistent WSDM queue, Amazon 2023 queue, and
+Tier-C queue every five minutes, restarts a queue if its PID is dead and its
+log has not reached the done marker, and writes heartbeat logs under
+`/data/users/atavory/scratch/wsdm_experiments/results/wsdm_overnight_watchdog_20260812/`.
+
 ## Library
 
 `rq.py` — core implementation:
