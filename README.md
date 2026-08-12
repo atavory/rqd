@@ -9,8 +9,10 @@ models and interaction logs evolve.
 pip install -r requirements.txt
 ```
 
-The corrected web-recommender experiments additionally use CPU PyTorch. No GPU
-is required.
+The committed producer runs on CPU and additionally uses CPU PyTorch for the
+downstream consumer. A batched CUDA RQ/k-means backend is planned for the
+larger WSDM matrix; GPU results are not interchangeable with the committed CPU
+path until parity tests pass.
 
 ## Corrected web-recommender suite
 
@@ -96,6 +98,13 @@ python3 run_wsdm_index_sweep.py \
   --freeze-depths 1,2,3 \
   --output results/amazon2023_books_funnel24_seed0.json
 ```
+
+The WSDM-scale protocol evaluates six full catalogs with five seeds and all
+three freeze depths, plus a separate multi-million-item Amazon Books stress
+test and focused architecture/consumer subsets. The larger raw matrix is
+reported compactly: one dataset-and-scale table, one aggregate full-catalog
+table, and one aggregate downstream-consumer table. Detailed rows remain in
+the companion artifact rather than becoming one paper table per dataset.
 
 Run one independently reproducible seed:
 
