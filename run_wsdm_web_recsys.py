@@ -57,6 +57,8 @@ ARCHITECTURES = {
     "funnel24": [16, 16, 256, 256],
 }
 
+RANKING_CUTOFFS = (5, 10, 20, 50, 200)
+
 
 def _json_default(value):
     if isinstance(value, (np.integer, np.floating)):
@@ -343,6 +345,39 @@ def _codebook_bytes(rq: RQ, stages=None) -> int:
     return int(sum(rq.cb[s].nbytes for s in stages))
 
 
+def _assign_to_centroids(x, centroids):
+    x_norm = np.sum(x * x, axis=1, keepdims=True)
+    c_norm = np.sum(centroids * centroids, axis=1)[None, :]
+    distances = x_norm + c_norm - 2.0 * (x @ centroids.T)
+    return np.argmin(np.maximum(distances, 0.0), axis=1).astype(np.int64)
+
+
+def ema_retrain(rq: RQ, embeddings, decay: float, n_iter: int = 20) -> RQ:
+    """Streaming-VQ/EMA codebook update that preserves token identities.
+
+    This is the classical repair baseline: labels are not reinitialized, but
+    every centroid is moved toward the target-period residual mean under its
+    current assignment. Prefixes can still churn because Voronoi boundaries move.
+    """
+    updated = RQ(rq.m, rq.K, rq.dim)
+    updated.cb = [centroids.copy() for centroids in rq.cb]
+    for _ in range(n_iter):
+        residual = embeddings.copy()
+        for stage in range(updated.m):
+            assignments = _assign_to_centroids(residual, updated.cb[stage])
+            target_centroids = updated.cb[stage].copy()
+            for token in range(updated.K[stage]):
+                mask = assignments == token
+                if mask.any():
+                    target_centroids[token] = residual[mask].mean(axis=0)
+            updated.cb[stage] = (
+                decay * updated.cb[stage]
+                + (1.0 - decay) * target_centroids
+            ).astype(np.float32)
+            residual = residual - updated.cb[stage][assignments]
+    return updated
+
+
 def _prefix_bucket_metrics(rq: RQ, embeddings, freeze_depth: int) -> dict:
     """Summarize the full catalog partition induced by a prefix."""
     codes = rq.encode(embeddings)[:, :freeze_depth]
@@ -381,11 +416,15 @@ def _index_strategy_metrics(name, rq, embeddings, freeze_depth, churn,
         "prefix_churn_raw": churn["raw"],
         "prefix_churn_centroid_aligned": churn["centroid_aligned"],
         "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+        "prefix_churn_headline": churn["assignment_aligned"],
         "items_reindexed": int(round(churn["raw"] * n_items)),
         "items_reindexed_centroid_aligned": int(round(
             churn["centroid_aligned"] * n_items
         )),
         "items_reindexed_assignment_aligned": int(round(
+            churn["assignment_aligned"] * n_items
+        )),
+        "items_reindexed_headline": int(round(
             churn["assignment_aligned"] * n_items
         )),
         "codebook_update_bytes": codebook_update_bytes,
@@ -486,8 +525,10 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
     lengths = torch.tensor([len(tokens) for tokens in tok_eval], device=device)
     padding_mask = torch.arange(max_len, device=device)[None, :] >= lengths[:, None]
 
-    recalls = {10: 0, 50: 0, 200: 0}
-    conditional = {10: 0, 50: 0, 200: 0}
+    hits = {cutoff: 0 for cutoff in RANKING_CUTOFFS}
+    dcg = {cutoff: 0.0 for cutoff in RANKING_CUTOFFS}
+    conditional_hits = {cutoff: 0 for cutoff in RANKING_CUTOFFS}
+    conditional_dcg = {cutoff: 0.0 for cutoff in RANKING_CUTOFFS}
     coverage = 0
     candidate_counts = []
     started = time.perf_counter()
@@ -511,33 +552,60 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             history = histories[start + local]
             query = embeddings[history[-3:]].mean(axis=0)
             distances = np.sum((item_decoded[candidates] - query) ** 2, axis=1)
-            top_count = min(200, len(candidates))
+            top_count = min(max(RANKING_CUTOFFS), len(candidates))
             top = np.argpartition(distances, top_count - 1)[:top_count]
             top = top[np.argsort(distances[top])]
             ranking = candidates[top]
-            for cutoff in recalls:
-                hit = target in ranking[:cutoff]
-                recalls[cutoff] += int(hit)
-                conditional[cutoff] += int(hit and covered)
+            target_positions = np.flatnonzero(ranking == target)
+            target_rank = (
+                int(target_positions[0]) if len(target_positions) else None
+            )
+            target_gain = (
+                1.0 / math.log2(target_rank + 2)
+                if target_rank is not None else 0.0
+            )
+            for cutoff in RANKING_CUTOFFS:
+                hit = target_rank is not None and target_rank < cutoff
+                hits[cutoff] += int(hit)
+                dcg[cutoff] += target_gain if hit else 0.0
+                conditional_hits[cutoff] += int(hit and covered)
+                conditional_dcg[cutoff] += (
+                    target_gain if hit and covered else 0.0
+                )
 
     elapsed = time.perf_counter() - started
     total = len(eval_t1)
     candidate_counts = np.asarray(candidate_counts, dtype=np.float64)
-    return {
+    metrics = {
         "n_eval": total,
         "routing_coverage": coverage / max(total, 1),
-        "recall_at_10": recalls[10] / max(total, 1),
-        "recall_at_50": recalls[50] / max(total, 1),
-        "recall_at_200": recalls[200] / max(total, 1),
-        "conditional_recall_at_10": conditional[10] / max(coverage, 1),
-        "conditional_recall_at_50": conditional[50] / max(coverage, 1),
-        "conditional_recall_at_200": conditional[200] / max(coverage, 1),
-        "candidate_count_mean": float(candidate_counts.mean()),
-        "candidate_count_p50": float(np.percentile(candidate_counts, 50)),
-        "candidate_count_p95": float(np.percentile(candidate_counts, 95)),
         "evaluation_seconds": elapsed,
         "query_milliseconds": 1000.0 * elapsed / max(total, 1),
     }
+    for cutoff in RANKING_CUTOFFS:
+        hit_rate = hits[cutoff] / max(total, 1)
+        conditional_hit_rate = conditional_hits[cutoff] / max(coverage, 1)
+        metrics[f"hit_rate_at_{cutoff}"] = hit_rate
+        metrics[f"recall_at_{cutoff}"] = hit_rate
+        metrics[f"ndcg_at_{cutoff}"] = dcg[cutoff] / max(total, 1)
+        metrics[f"conditional_hit_rate_at_{cutoff}"] = conditional_hit_rate
+        metrics[f"conditional_recall_at_{cutoff}"] = conditional_hit_rate
+        metrics[f"conditional_ndcg_at_{cutoff}"] = (
+            conditional_dcg[cutoff] / max(coverage, 1)
+        )
+    if len(candidate_counts):
+        metrics.update({
+            "candidate_count_mean": float(candidate_counts.mean()),
+            "candidate_count_p50": float(np.percentile(candidate_counts, 50)),
+            "candidate_count_p95": float(np.percentile(candidate_counts, 95)),
+        })
+    else:
+        metrics.update({
+            "candidate_count_mean": 0.0,
+            "candidate_count_p50": 0.0,
+            "candidate_count_p95": 0.0,
+        })
+    return metrics
 
 
 def evaluate_beam_sweep(model, eval_t1, history_rq, item_rq, embeddings,
@@ -574,6 +642,7 @@ def run_seed(args) -> None:
         "configuration": {
             "arch": args.arch,
             "codes_per_stage": codes,
+            "codebook_sizes": codes,
             "total_bits": total_bits,
             "freeze_depth": freeze_depth,
             "seed": seed,
@@ -581,10 +650,16 @@ def run_seed(args) -> None:
             "n_beams": args.n_beams,
             "beam_values": args.beam_values,
             "device": args.device,
+            "ema_decay": args.ema_decay,
+            "ema_iterations": args.ema_iterations,
             "capacity": int(np.prod(np.asarray(codes, dtype=np.int64))),
             "capacity_per_item": float(np.prod(np.asarray(codes, dtype=np.int64)) / n_items),
             "source_codebook_initialization": "independent k-means++",
             "source_codebook_seed": seed,
+            "warm_full_codebook_initialization": (
+                "source codebook warm-start with no frozen prefix"
+            ),
+            "warm_full_codebook_seed": seed,
             "full_codebook_initialization": "independent k-means++ (not warm-started)",
             "full_codebook_seed": seed + 500,
             "label_alignment_during_training": "none",
@@ -606,6 +681,27 @@ def run_seed(args) -> None:
         rq_source, embeddings_t1, freeze_depth, seed=seed,
     )
     payload["timing"]["suffix_update_seconds"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    rq_warm_full = warm_retrain(
+        rq_source, embeddings_t1, 0, seed=seed,
+    )
+    payload["timing"]["warm_full_codebook_seconds"] = (
+        time.perf_counter() - started
+    )
+    warm_full_churn = _prefix_churn_metrics(
+        rq_source, rq_warm_full, embeddings_t1, freeze_depth,
+    )
+
+    started = time.perf_counter()
+    rq_ema = ema_retrain(
+        rq_source, embeddings_t1,
+        decay=args.ema_decay, n_iter=args.ema_iterations,
+    )
+    payload["timing"]["ema_codebook_seconds"] = time.perf_counter() - started
+    ema_churn = _prefix_churn_metrics(
+        rq_source, rq_ema, embeddings_t1, freeze_depth,
+    )
 
     started = time.perf_counter()
     rq_full = RQ(4, codes, embeddings_t1.shape[1]).fit(
@@ -632,16 +728,35 @@ def run_seed(args) -> None:
                 _codebook_bytes(rq_stratified, range(freeze_depth, 4)),
             ),
             _index_strategy_metrics(
+                "warm_start_full_update", rq_warm_full, embeddings_t1,
+                freeze_depth, warm_full_churn, n_items,
+                _codebook_bytes(rq_warm_full),
+            ),
+            _index_strategy_metrics(
+                "ema_streaming_vq", rq_ema, embeddings_t1, freeze_depth,
+                ema_churn, n_items, _codebook_bytes(rq_ema),
+            ),
+            _index_strategy_metrics(
                 "full_retrained", rq_full, embeddings_t1, freeze_depth,
                 full_churn, n_items, _codebook_bytes(rq_full),
             ),
         ]
-        frozen_mse, stratified_mse, full_mse = (
-            row["mse"] for row in payload["strategies"]
-        )
+        mse_by_strategy = {
+            row["strategy"]: row["mse"] for row in payload["strategies"]
+        }
+        frozen_mse = mse_by_strategy["frozen"]
+        full_mse = mse_by_strategy["full_retrained"]
         payload["summary"] = {
             "stratified_gap_recovery": float(
-                (frozen_mse - stratified_mse)
+                (frozen_mse - mse_by_strategy["stratified"])
+                / max(frozen_mse - full_mse, 1e-12)
+            ),
+            "warm_start_full_gap_recovery": float(
+                (frozen_mse - mse_by_strategy["warm_start_full_update"])
+                / max(frozen_mse - full_mse, 1e-12)
+            ),
+            "ema_gap_recovery": float(
+                (frozen_mse - mse_by_strategy["ema_streaming_vq"])
                 / max(frozen_mse - full_mse, 1e-12)
             ),
         }
@@ -676,6 +791,14 @@ def run_seed(args) -> None:
             False, None, "none",
         ),
         (
+            "warm_start_full_old_generator", source_model, rq_source,
+            rq_warm_full, warm_full_churn, False, None, "none",
+        ),
+        (
+            "ema_streaming_vq_old_generator", source_model, rq_source,
+            rq_ema, ema_churn, False, None, "none",
+        ),
+        (
             "full_old_generator", source_model, rq_source, rq_full,
             full_churn, False, None, "none",
         ),
@@ -706,11 +829,15 @@ def run_seed(args) -> None:
             "prefix_churn_raw": churn["raw"],
             "prefix_churn_centroid_aligned": churn["centroid_aligned"],
             "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+            "prefix_churn_headline": churn["assignment_aligned"],
             "items_reindexed": int(round(churn["raw"] * n_items)),
             "items_reindexed_centroid_aligned": int(round(
                 churn["centroid_aligned"] * n_items
             )),
             "items_reindexed_assignment_aligned": int(round(
+                churn["assignment_aligned"] * n_items
+            )),
+            "items_reindexed_headline": int(round(
                 churn["assignment_aligned"] * n_items
             )),
             "consumer_retrained": retrained,
@@ -743,12 +870,62 @@ def run_seed(args) -> None:
         print(json.dumps(payload, indent=2, default=_json_default), flush=True)
         return
 
+    # GRM-only retrains the downstream recommender while leaving the tokenizer
+    # and serving index frozen. This closes the "just retrain the consumer"
+    # reviewer escape hatch.
+    target_histories = [history for _, history, _ in eval_t1]
+    source_codes_t1 = rq_source.encode(embeddings_t1)
+    tok_new_source, stg_new_source = prefix_seqs(
+        target_histories, source_codes_t1, freeze_depth,
+    )
+    tok_grm, stg_grm = tok_t0 + tok_new_source, stg_t0 + stg_new_source
+    torch.manual_seed(seed + 900)
+    grm_model = PrefixGenerator(
+        codes[:freeze_depth], d_model=128, n_heads=4, n_layers=3,
+    )
+    started = time.perf_counter()
+    grm_model = train_prefix_gen(
+        grm_model, tok_grm, stg_grm, freeze_depth,
+        epochs=args.epochs, device=args.device,
+    )
+    payload["timing"]["grm_generator_seconds"] = time.perf_counter() - started
+    payload["timing"]["grm_generator_training_sequences"] = len(tok_grm)
+    print("evaluating grm_only_retrained_generator", flush=True)
+    metrics = evaluate_prefix_routing(
+        grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
+        freeze_depth, args.n_beams, args.device,
+    )
+    metrics.update({
+        "strategy": "grm_only_retrained_generator",
+        "mse": rq_source.mse(embeddings_t1),
+        "prefix_churn": zero_churn["raw"],
+        "prefix_churn_raw": zero_churn["raw"],
+        "prefix_churn_centroid_aligned": zero_churn["centroid_aligned"],
+        "prefix_churn_assignment_aligned": zero_churn["assignment_aligned"],
+        "prefix_churn_headline": zero_churn["assignment_aligned"],
+        "items_reindexed": 0,
+        "items_reindexed_centroid_aligned": 0,
+        "items_reindexed_assignment_aligned": 0,
+        "items_reindexed_headline": 0,
+        "consumer_retrained": True,
+        "consumer_token_relabeling": "none",
+        "token_relabeling_bytes": 0,
+        "codebook_update_bytes": 0,
+    })
+    payload["strategies"].append(metrics)
+    payload["beam_sweep"].extend(evaluate_beam_sweep(
+        grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
+        freeze_depth,
+        [value for value in args.beam_values if value != args.n_beams],
+        args.device, "grm_only_retrained_generator",
+    ))
+    _write_json(output, payload)
+
     # Full retraining plus a new consumer measures the expensive recovery path.
     # A true rebuild can re-encode the retained history under the new
     # vocabulary. Train this expensive recovery baseline on both source-period
     # sequences and target-period histories (with each evaluation target held
     # out), rather than unfairly giving it only the smaller target history.
-    target_histories = [history for _, history, _ in eval_t1]
     full_codes_t0 = rq_full.encode(embeddings_t0)
     full_codes_t1 = rq_full.encode(embeddings_t1)
     tok_old, stg_old = prefix_seqs(seqs_t0, full_codes_t0, freeze_depth)
@@ -778,11 +955,15 @@ def run_seed(args) -> None:
         "prefix_churn_raw": churn["raw"],
         "prefix_churn_centroid_aligned": churn["centroid_aligned"],
         "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+        "prefix_churn_headline": churn["assignment_aligned"],
         "items_reindexed": int(round(churn["raw"] * n_items)),
         "items_reindexed_centroid_aligned": int(round(
             churn["centroid_aligned"] * n_items
         )),
         "items_reindexed_assignment_aligned": int(round(
+            churn["assignment_aligned"] * n_items
+        )),
+        "items_reindexed_headline": int(round(
             churn["assignment_aligned"] * n_items
         )),
         "consumer_retrained": True,
@@ -836,6 +1017,8 @@ def parse_args():
         help="Number of stable prefix stages; remaining stages are adapted",
     )
     parser.add_argument("--n-beams", type=int, default=10)
+    parser.add_argument("--ema-decay", type=float, default=0.95)
+    parser.add_argument("--ema-iterations", type=int, default=20)
     parser.add_argument(
         "--beam-values",
         default="",
@@ -869,6 +1052,10 @@ def parse_args():
         parser.error("--amazon-core-passes must be nonnegative")
     if args.max_train_sequences < 0 or args.max_eval_sequences < 0:
         parser.error("sequence limits must be nonnegative")
+    if not 0.0 <= args.ema_decay < 1.0:
+        parser.error("--ema-decay must be in [0, 1)")
+    if args.ema_iterations <= 0:
+        parser.error("--ema-iterations must be positive")
     if not args.prepare_only and (args.arch is None or args.seed is None or args.output is None):
         parser.error("seeded runs require --arch, --seed, and --output")
     return args

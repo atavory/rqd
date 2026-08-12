@@ -23,6 +23,7 @@ from run_wsdm_web_recsys import (
     _json_default,
     _prefix_churn_metrics,
     _write_json,
+    ema_retrain,
     load_cache,
 )
 
@@ -44,16 +45,23 @@ def run(args) -> None:
             "mode": "full_catalog_index_sweep",
             "arch": args.arch,
             "codes_per_stage": codes,
+            "codebook_sizes": codes,
             "total_bits": total_bits,
             "freeze_depths": args.freeze_depths,
             "seed": args.seed,
             "kmeans_iterations": args.kmeans_iterations,
+            "ema_decay": args.ema_decay,
+            "ema_iterations": args.ema_iterations,
             "capacity": int(np.prod(np.asarray(codes, dtype=np.int64))),
             "capacity_per_item": float(
                 np.prod(np.asarray(codes, dtype=np.int64)) / n_items
             ),
             "source_codebook_initialization": "independent k-means++",
             "source_codebook_seed": args.seed,
+            "warm_full_codebook_initialization": (
+                "source codebook warm-start with no frozen prefix"
+            ),
+            "warm_full_codebook_seed": args.seed,
             "full_codebook_initialization": (
                 "independent k-means++ (not warm-started)"
             ),
@@ -70,6 +78,22 @@ def run(args) -> None:
         embeddings_t0, n_iter=args.kmeans_iterations, seed=args.seed,
     )
     payload["timing"]["source_codebook_seconds"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    rq_warm_full = warm_retrain(
+        rq_source, embeddings_t1, 0,
+        n_iter=args.kmeans_iterations, seed=args.seed,
+    )
+    payload["timing"]["warm_full_codebook_seconds"] = (
+        time.perf_counter() - started
+    )
+
+    started = time.perf_counter()
+    rq_ema = ema_retrain(
+        rq_source, embeddings_t1,
+        decay=args.ema_decay, n_iter=args.ema_iterations,
+    )
+    payload["timing"]["ema_codebook_seconds"] = time.perf_counter() - started
 
     started = time.perf_counter()
     rq_full = RQ(4, codes, embeddings_t1.shape[1]).fit(
@@ -92,6 +116,12 @@ def run(args) -> None:
         full_churn = _prefix_churn_metrics(
             rq_source, rq_full, embeddings_t1, freeze_depth,
         )
+        warm_full_churn = _prefix_churn_metrics(
+            rq_source, rq_warm_full, embeddings_t1, freeze_depth,
+        )
+        ema_churn = _prefix_churn_metrics(
+            rq_source, rq_ema, embeddings_t1, freeze_depth,
+        )
         strategies = [
             _index_strategy_metrics(
                 "frozen", rq_source, embeddings_t1, freeze_depth,
@@ -103,18 +133,35 @@ def run(args) -> None:
                 _codebook_bytes(rq_stratified, range(freeze_depth, 4)),
             ),
             _index_strategy_metrics(
+                "warm_start_full_update", rq_warm_full, embeddings_t1,
+                freeze_depth, warm_full_churn, n_items,
+                _codebook_bytes(rq_warm_full),
+            ),
+            _index_strategy_metrics(
+                "ema_streaming_vq", rq_ema, embeddings_t1, freeze_depth,
+                ema_churn, n_items, _codebook_bytes(rq_ema),
+            ),
+            _index_strategy_metrics(
                 "full_retrained", rq_full, embeddings_t1, freeze_depth,
                 full_churn, n_items, _codebook_bytes(rq_full),
             ),
         ]
-        frozen_mse, stratified_mse, full_mse = (
-            row["mse"] for row in strategies
-        )
+        mse_by_strategy = {row["strategy"]: row["mse"] for row in strategies}
+        frozen_mse = mse_by_strategy["frozen"]
+        full_mse = mse_by_strategy["full_retrained"]
         payload["runs"].append({
             "freeze_depth": freeze_depth,
             "suffix_update_seconds": suffix_seconds,
             "stratified_gap_recovery": float(
-                (frozen_mse - stratified_mse)
+                (frozen_mse - mse_by_strategy["stratified"])
+                / max(frozen_mse - full_mse, 1e-12)
+            ),
+            "warm_start_full_gap_recovery": float(
+                (frozen_mse - mse_by_strategy["warm_start_full_update"])
+                / max(frozen_mse - full_mse, 1e-12)
+            ),
+            "ema_gap_recovery": float(
+                (frozen_mse - mse_by_strategy["ema_streaming_vq"])
                 / max(frozen_mse - full_mse, 1e-12)
             ),
             "strategies": strategies,
@@ -137,6 +184,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--freeze-depths", default="1,2,3")
     parser.add_argument("--kmeans-iterations", type=int, default=20)
+    parser.add_argument("--ema-decay", type=float, default=0.95)
+    parser.add_argument("--ema-iterations", type=int, default=20)
     parser.add_argument("--output", required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -151,6 +200,10 @@ def parse_args():
         parser.error("--freeze-depths must contain only 1, 2, or 3")
     if args.kmeans_iterations <= 0:
         parser.error("--kmeans-iterations must be positive")
+    if not 0.0 <= args.ema_decay < 1.0:
+        parser.error("--ema-decay must be in [0, 1)")
+    if args.ema_iterations <= 0:
+        parser.error("--ema-iterations must be positive")
     return args
 
 
