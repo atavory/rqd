@@ -189,6 +189,55 @@ interface probes stay low.
 `diagnostic_rows.csv`, `index_summary.csv`, and `cost_summary.csv` from a
 result directory.
 
+### Tier-C retraining prediction scripts
+
+`run_tier_c_retrain_prediction.py` is the public synthetic-control runner for
+testing the decision rule. It creates known drift regimes and predicts the
+cheapest sufficient update rung:
+
+- `do_nothing`: no meaningful drift;
+- `geometry_reconstruction`: suffix-only tokenizer repair should be enough;
+- `suffix_capacity`: the suffix cannot repair the drift at the current rate;
+- `interface_drift`: prefix routes cross, so selective/full migration is
+  required;
+- `consumer_only`: geometry and routing stay stable, but GRM/consumer retrain
+  is required.
+
+Example:
+
+```bash
+python3 run_tier_c_retrain_prediction.py \
+  --output results/tier_c_synthetic_retrain_predictions.json \
+  --csv-output results/tier_c_synthetic_retrain_predictions.csv \
+  --arches funnel24 --seeds 0,1,2,3,4 \
+  --freeze-depths 1,2,3 \
+  --magnitudes 0.0,0.05,0.15,0.35,0.7
+```
+
+`summarize_tier_c_retrain_predictions.py` reads completed WSDM JSON artifacts
+and emits one real-dataset prediction CSV:
+
+```bash
+python3 summarize_tier_c_retrain_predictions.py \
+  --results-dir results/phase0_ml1m_primary24_20260812 \
+  --results-dir results/amazon_tierb_20260812 \
+  --output results/tier_c_real_retrain_predictions.csv
+```
+
+`run_tier_c_retrain_prediction_queue.sh` is the overnight queue wrapper. It
+runs the synthetic matrix, reruns real index sweeps with the committed
+diagnostic schema, waits for the existing WSDM queues, and then writes the
+combined Tier-C prediction CSV. Defaults are intentionally absolute for the
+two-GPU scratch box:
+
+```bash
+OUT_ROOT=/data/users/atavory/scratch/wsdm_experiments/results/tier_c_retrain_prediction_20260812 \
+  ./run_tier_c_retrain_prediction_queue.sh
+```
+
+The queue is restart-safe: complete valid JSONs are skipped, and logs live
+under `$OUT_ROOT/queue/logs/`.
+
 ## Library
 
 `rq.py` — core implementation:
