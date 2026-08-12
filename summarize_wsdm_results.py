@@ -19,7 +19,14 @@ DOWNSTREAM_FIELDS = [
     "seed",
     "strategy",
     "consumer_retrained",
+    "consumer_retrain_required",
     "consumer_token_relabeling",
+    "id_migration_required",
+    "serving_index_rebuild_required",
+    "tokenizer_update_seconds",
+    "consumer_retrain_seconds",
+    "consumer_training_sequences",
+    "update_wall_seconds",
     "hit_rate_at_5",
     "hit_rate_at_10",
     "hit_rate_at_20",
@@ -63,6 +70,13 @@ INDEX_RUN_FIELDS = [
     "strategy",
     "mse",
     "normalized_mse",
+    "consumer_retrain_required",
+    "id_migration_required",
+    "serving_index_rebuild_required",
+    "tokenizer_update_seconds",
+    "consumer_retrain_seconds",
+    "consumer_training_sequences",
+    "update_wall_seconds",
     "prefix_churn_headline",
     "prefix_churn_raw",
     "prefix_churn_centroid_aligned",
@@ -102,9 +116,36 @@ INDEX_SUMMARY_FIELDS = [
     "prefix_churn_assignment_aligned_mean",
     "items_reindexed_headline_mean",
     "codebook_update_bytes_mean",
+    "tokenizer_update_seconds_mean",
+    "consumer_retrain_seconds_mean",
+    "update_wall_seconds_mean",
     "stratified_gap_recovery_mean",
     "warm_start_full_gap_recovery_mean",
     "ema_gap_recovery_mean",
+]
+
+COST_SUMMARY_FIELDS = [
+    "dataset",
+    "arch",
+    "codebook_sizes",
+    "total_bits",
+    "freeze_depth",
+    "strategy",
+    "n",
+    "ndcg_at_10_mean",
+    "hit_rate_at_10_mean",
+    "recall_at_200_mean",
+    "mse_mean",
+    "prefix_churn_headline_mean",
+    "items_reindexed_headline_mean",
+    "codebook_update_bytes_mean",
+    "tokenizer_update_seconds_mean",
+    "consumer_retrain_required_any",
+    "consumer_retrain_seconds_mean",
+    "consumer_training_sequences_mean",
+    "id_migration_required_any",
+    "serving_index_rebuild_required_any",
+    "update_wall_seconds_mean",
 ]
 
 
@@ -141,6 +182,80 @@ def _headline_items(row: dict) -> int:
     )
 
 
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def _tokenizer_update_seconds(strategy: str, timing: dict, run: dict | None):
+    if strategy == "frozen" or strategy == "grm_only_retrained_generator":
+        return 0.0
+    if strategy == "stratified":
+        if run is not None:
+            return run.get("suffix_update_seconds", 0.0)
+        return timing.get("suffix_update_seconds", 0.0)
+    if strategy.startswith("warm_start_full"):
+        return timing.get("warm_full_codebook_seconds", 0.0)
+    if strategy.startswith("ema_streaming_vq"):
+        return timing.get("ema_codebook_seconds", 0.0)
+    if strategy.startswith("full_"):
+        return timing.get("full_codebook_seconds", 0.0)
+    return 0.0
+
+
+def _consumer_retrain_seconds(strategy: str, timing: dict):
+    if strategy == "grm_only_retrained_generator":
+        return timing.get("grm_generator_seconds", 0.0)
+    if strategy == "full_retrained_generator":
+        return timing.get("target_generator_seconds", 0.0)
+    return 0.0
+
+
+def _consumer_training_sequences(strategy: str, timing: dict) -> int:
+    if strategy == "grm_only_retrained_generator":
+        return int(timing.get("grm_generator_training_sequences", 0))
+    if strategy == "full_retrained_generator":
+        return int(timing.get("target_generator_training_sequences", 0))
+    return 0
+
+
+def _fill_cost_fields(row: dict, payload: dict, run: dict | None = None) -> None:
+    strategy = row.get("strategy", "")
+    timing = payload.get("timing", {})
+    headline_items = _headline_items(row)
+    consumer_retrain_required = _truthy(row.get("consumer_retrained", False))
+    tokenizer_seconds = row.get("tokenizer_update_seconds")
+    if tokenizer_seconds in (None, ""):
+        tokenizer_seconds = _tokenizer_update_seconds(strategy, timing, run)
+    consumer_seconds = row.get("consumer_retrain_seconds")
+    if consumer_seconds in (None, ""):
+        consumer_seconds = _consumer_retrain_seconds(strategy, timing)
+    consumer_sequences = row.get("consumer_training_sequences")
+    if consumer_sequences in (None, ""):
+        consumer_sequences = _consumer_training_sequences(strategy, timing)
+
+    tokenizer_seconds = float(tokenizer_seconds)
+    consumer_seconds = float(consumer_seconds)
+    row["id_migration_required"] = row.get(
+        "id_migration_required", headline_items > 0,
+    )
+    row["serving_index_rebuild_required"] = row.get(
+        "serving_index_rebuild_required", headline_items > 0,
+    )
+    row["consumer_retrain_required"] = row.get(
+        "consumer_retrain_required", consumer_retrain_required,
+    )
+    row["tokenizer_update_seconds"] = tokenizer_seconds
+    row["consumer_retrain_seconds"] = consumer_seconds
+    row["consumer_training_sequences"] = int(consumer_sequences)
+    row["update_wall_seconds"] = row.get(
+        "update_wall_seconds", tokenizer_seconds + consumer_seconds,
+    )
+
+
 def _base_fields(path: Path, payload: dict) -> dict:
     configuration = payload.get("configuration", {})
     return {
@@ -166,6 +281,7 @@ def _downstream_rows(results_dir: Path) -> list[dict]:
             row.update(strategy)
             row["prefix_churn_headline"] = _headline_churn(strategy)
             row["items_reindexed_headline"] = _headline_items(strategy)
+            _fill_cost_fields(row, payload)
             rows.append(row)
     return rows
 
@@ -192,6 +308,7 @@ def _index_rows(results_dir: Path) -> list[dict]:
                 row.update(strategy)
                 row["prefix_churn_headline"] = _headline_churn(strategy)
                 row["items_reindexed_headline"] = _headline_items(strategy)
+                _fill_cost_fields(row, payload, run)
                 rows.append(row)
     return rows
 
@@ -250,6 +367,18 @@ def _index_summary(rows: list[dict]) -> list[dict]:
                 float(row["codebook_update_bytes"]) for row in group
                 if row.get("codebook_update_bytes") != ""
             ]),
+            "tokenizer_update_seconds_mean": _mean([
+                float(row["tokenizer_update_seconds"]) for row in group
+                if row.get("tokenizer_update_seconds") != ""
+            ]),
+            "consumer_retrain_seconds_mean": _mean([
+                float(row["consumer_retrain_seconds"]) for row in group
+                if row.get("consumer_retrain_seconds") != ""
+            ]),
+            "update_wall_seconds_mean": _mean([
+                float(row["update_wall_seconds"]) for row in group
+                if row.get("update_wall_seconds") != ""
+            ]),
             "stratified_gap_recovery_mean": _mean([
                 float(row["stratified_gap_recovery"]) for row in group
                 if row.get("stratified_gap_recovery") != ""
@@ -267,10 +396,98 @@ def _index_summary(rows: list[dict]) -> list[dict]:
     return summary
 
 
+def _cost_summary(rows: list[dict]) -> list[dict]:
+    groups = defaultdict(list)
+    for row in rows:
+        key = (
+            row.get("dataset", ""),
+            row.get("arch", ""),
+            row.get("codebook_sizes", ""),
+            row.get("total_bits", ""),
+            row.get("freeze_depth", ""),
+            row.get("strategy", ""),
+        )
+        groups[key].append(row)
+
+    summary = []
+    for key, group in sorted(groups.items()):
+        summary.append({
+            "dataset": key[0],
+            "arch": key[1],
+            "codebook_sizes": key[2],
+            "total_bits": key[3],
+            "freeze_depth": key[4],
+            "strategy": key[5],
+            "n": len(group),
+            "ndcg_at_10_mean": _mean([
+                float(row["ndcg_at_10"]) for row in group
+                if row.get("ndcg_at_10") != ""
+            ]),
+            "hit_rate_at_10_mean": _mean([
+                float(row["hit_rate_at_10"]) for row in group
+                if row.get("hit_rate_at_10") != ""
+            ]),
+            "recall_at_200_mean": _mean([
+                float(row["recall_at_200"]) for row in group
+                if row.get("recall_at_200") != ""
+            ]),
+            "mse_mean": _mean([
+                float(row["mse"]) for row in group
+                if row.get("mse") != ""
+            ]),
+            "prefix_churn_headline_mean": _mean([
+                float(row["prefix_churn_headline"]) for row in group
+                if row.get("prefix_churn_headline") != ""
+            ]),
+            "items_reindexed_headline_mean": _mean([
+                float(row["items_reindexed_headline"]) for row in group
+                if row.get("items_reindexed_headline") != ""
+            ]),
+            "codebook_update_bytes_mean": _mean([
+                float(row["codebook_update_bytes"]) for row in group
+                if row.get("codebook_update_bytes") != ""
+            ]),
+            "tokenizer_update_seconds_mean": _mean([
+                float(row["tokenizer_update_seconds"]) for row in group
+                if row.get("tokenizer_update_seconds") != ""
+            ]),
+            "consumer_retrain_required_any": any(
+                _truthy(row.get("consumer_retrain_required", False))
+                for row in group
+            ),
+            "consumer_retrain_seconds_mean": _mean([
+                float(row["consumer_retrain_seconds"]) for row in group
+                if row.get("consumer_retrain_seconds") != ""
+            ]),
+            "consumer_training_sequences_mean": _mean([
+                float(row["consumer_training_sequences"]) for row in group
+                if row.get("consumer_training_sequences") != ""
+            ]),
+            "id_migration_required_any": any(
+                _truthy(row.get("id_migration_required", False))
+                for row in group
+            ),
+            "serving_index_rebuild_required_any": any(
+                _truthy(row.get("serving_index_rebuild_required", False))
+                for row in group
+            ),
+            "update_wall_seconds_mean": _mean([
+                float(row["update_wall_seconds"]) for row in group
+                if row.get("update_wall_seconds") != ""
+            ]),
+        })
+    return summary
+
+
 def _write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fields,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
     tmp.replace(path)
@@ -292,15 +509,20 @@ def main() -> None:
     downstream = _downstream_rows(results_dir)
     index_rows = _index_rows(results_dir)
     index_summary = _index_summary(index_rows)
+    cost_summary = _cost_summary(downstream)
 
     _write_csv(output_dir / "downstream_rows.csv", DOWNSTREAM_FIELDS, downstream)
     _write_csv(output_dir / "index_runs.csv", INDEX_RUN_FIELDS, index_rows)
     _write_csv(
         output_dir / "index_summary.csv", INDEX_SUMMARY_FIELDS, index_summary,
     )
+    _write_csv(
+        output_dir / "cost_summary.csv", COST_SUMMARY_FIELDS, cost_summary,
+    )
     print(
         f"wrote {len(downstream)} downstream rows, "
-        f"{len(index_rows)} index rows, {len(index_summary)} index summaries "
+        f"{len(index_rows)} index rows, {len(index_summary)} index summaries, "
+        f"{len(cost_summary)} cost summaries "
         f"to {output_dir}",
         flush=True,
     )

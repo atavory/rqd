@@ -25,13 +25,17 @@ five-core benchmark. It provides:
 - freeze-depth and beam-count sweeps;
 - frozen, suffix-adapted, full-retrain/old-consumer, and
   full-retrain/rebuilt-consumer strategies;
+- warm-start-full, EMA/streaming-VQ, and GRM-only comparison baselines;
 - centroid-Hungarian and assignment-optimal global relabeling baselines for
   the old consumer, testing whether token permutation alone explains failure;
-- recall, routing coverage, candidate work, MSE, prefix churn, reindex counts,
-  and codebook-update size in one JSON artifact per seed;
+- HR/NDCG/Recall at standard cutoffs, routing coverage, candidate work, MSE,
+  prefix churn, reindex counts, and codebook-update size in one JSON artifact
+  per seed;
 - raw token churn together with centroid-Hungarian and assignment-optimal
   label-aligned churn, so arbitrary k-means token permutations are not
   mistaken for genuine interface changes.
+- per-strategy cost-axis fields: tokenizer update seconds, consumer retrain
+  seconds, training-sequence counts, ID-migration flags, and update wall time.
 - an `--index-only` mode for full-catalog reconstruction, aligned churn, and
   prefix-bucket statistics without the much smaller sampled consumer workload.
 
@@ -141,6 +145,24 @@ The downstream runner also evaluates the unchanged old consumer against the
 fully retrained catalog after applying each global mapping to the retrained
 prefix tokens. If either baseline restores routing, the failure is attributable
 to a removable label permutation rather than genuine interface reassignment.
+
+### Cost-axis interpretation
+
+The WSDM comparison is not a best-NDCG-at-any-cost bakeoff. JSON and CSV rows
+therefore distinguish:
+
+- `tokenizer_update_seconds`: codebook maintenance cost for the strategy;
+- `consumer_retrain_seconds` and `consumer_training_sequences`: downstream GRM
+  retraining cost, nonzero for GRM-only and rebuilt-consumer baselines;
+- `id_migration_required` / `serving_index_rebuild_required`: whether retained
+  item IDs must move under assignment-aligned churn;
+- `update_wall_seconds`: tokenizer update plus downstream retrain cost.
+
+Paper-facing churn uses `prefix_churn_headline`, which is assignment-optimal
+aligned churn. Bare `prefix_churn` remains a raw-churn compatibility alias.
+
+`summarize_wsdm_results.py` writes `downstream_rows.csv`, `index_runs.csv`,
+`index_summary.csv`, and `cost_summary.csv` from a result directory.
 
 ## Library
 

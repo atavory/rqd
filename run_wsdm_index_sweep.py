@@ -131,19 +131,23 @@ def run(args) -> None:
                 "stratified", rq_stratified, embeddings_t1, freeze_depth,
                 zero_churn, n_items,
                 _codebook_bytes(rq_stratified, range(freeze_depth, 4)),
+                suffix_seconds,
             ),
             _index_strategy_metrics(
                 "warm_start_full_update", rq_warm_full, embeddings_t1,
                 freeze_depth, warm_full_churn, n_items,
                 _codebook_bytes(rq_warm_full),
+                payload["timing"]["warm_full_codebook_seconds"],
             ),
             _index_strategy_metrics(
                 "ema_streaming_vq", rq_ema, embeddings_t1, freeze_depth,
                 ema_churn, n_items, _codebook_bytes(rq_ema),
+                payload["timing"]["ema_codebook_seconds"],
             ),
             _index_strategy_metrics(
                 "full_retrained", rq_full, embeddings_t1, freeze_depth,
                 full_churn, n_items, _codebook_bytes(rq_full),
+                payload["timing"]["full_codebook_seconds"],
             ),
         ]
         mse_by_strategy = {row["strategy"]: row["mse"] for row in strategies}

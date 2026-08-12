@@ -345,6 +345,59 @@ def _codebook_bytes(rq: RQ, stages=None) -> int:
     return int(sum(rq.cb[s].nbytes for s in stages))
 
 
+def _churn_payload(churn, n_items: int) -> dict:
+    headline_items = int(round(churn["assignment_aligned"] * n_items))
+    return {
+        "prefix_churn": churn["raw"],
+        "prefix_churn_raw": churn["raw"],
+        "prefix_churn_centroid_aligned": churn["centroid_aligned"],
+        "prefix_churn_assignment_aligned": churn["assignment_aligned"],
+        "prefix_churn_headline": churn["assignment_aligned"],
+        "items_reindexed": int(round(churn["raw"] * n_items)),
+        "items_reindexed_centroid_aligned": int(round(
+            churn["centroid_aligned"] * n_items
+        )),
+        "items_reindexed_assignment_aligned": headline_items,
+        "items_reindexed_headline": headline_items,
+        "id_migration_required": headline_items > 0,
+        "serving_index_rebuild_required": headline_items > 0,
+    }
+
+
+def _strategy_cost_payload(
+    *,
+    codebook_update_bytes: int,
+    tokenizer_update_seconds: float = 0.0,
+    consumer_retrain_seconds: float = 0.0,
+    consumer_training_sequences: int = 0,
+    consumer_retrain_required: bool = False,
+) -> dict:
+    return {
+        "codebook_update_bytes": codebook_update_bytes,
+        "tokenizer_update_seconds": float(tokenizer_update_seconds),
+        "consumer_retrain_seconds": float(consumer_retrain_seconds),
+        "consumer_training_sequences": int(consumer_training_sequences),
+        "consumer_retrain_required": bool(consumer_retrain_required),
+        "update_wall_seconds": float(
+            tokenizer_update_seconds + consumer_retrain_seconds
+        ),
+    }
+
+
+def _tokenizer_update_seconds_for_strategy(name: str, timing: dict) -> float:
+    if name == "frozen":
+        return 0.0
+    if name == "stratified":
+        return float(timing.get("suffix_update_seconds", 0.0))
+    if name.startswith("warm_start_full"):
+        return float(timing.get("warm_full_codebook_seconds", 0.0))
+    if name.startswith("ema_streaming_vq"):
+        return float(timing.get("ema_codebook_seconds", 0.0))
+    if name.startswith("full_"):
+        return float(timing.get("full_codebook_seconds", 0.0))
+    return 0.0
+
+
 def _assign_to_centroids(x, centroids):
     x_norm = np.sum(x * x, axis=1, keepdims=True)
     c_norm = np.sum(centroids * centroids, axis=1)[None, :]
@@ -405,29 +458,19 @@ def _prefix_bucket_metrics(rq: RQ, embeddings, freeze_depth: int) -> dict:
 
 
 def _index_strategy_metrics(name, rq, embeddings, freeze_depth, churn,
-                            n_items: int, codebook_update_bytes: int) -> dict:
+                            n_items: int, codebook_update_bytes: int,
+                            tokenizer_update_seconds: float = 0.0) -> dict:
     mse = rq.mse(embeddings)
     energy = float(np.mean(np.sum(embeddings ** 2, axis=1)))
     return {
         "strategy": name,
         "mse": mse,
         "normalized_mse": float(mse / max(energy, 1e-12)),
-        "prefix_churn": churn["raw"],
-        "prefix_churn_raw": churn["raw"],
-        "prefix_churn_centroid_aligned": churn["centroid_aligned"],
-        "prefix_churn_assignment_aligned": churn["assignment_aligned"],
-        "prefix_churn_headline": churn["assignment_aligned"],
-        "items_reindexed": int(round(churn["raw"] * n_items)),
-        "items_reindexed_centroid_aligned": int(round(
-            churn["centroid_aligned"] * n_items
-        )),
-        "items_reindexed_assignment_aligned": int(round(
-            churn["assignment_aligned"] * n_items
-        )),
-        "items_reindexed_headline": int(round(
-            churn["assignment_aligned"] * n_items
-        )),
-        "codebook_update_bytes": codebook_update_bytes,
+        **_churn_payload(churn, n_items),
+        **_strategy_cost_payload(
+            codebook_update_bytes=codebook_update_bytes,
+            tokenizer_update_seconds=tokenizer_update_seconds,
+        ),
         **_prefix_bucket_metrics(rq, embeddings, freeze_depth),
     }
 
@@ -726,19 +769,23 @@ def run_seed(args) -> None:
                 "stratified", rq_stratified, embeddings_t1, freeze_depth,
                 zero_churn, n_items,
                 _codebook_bytes(rq_stratified, range(freeze_depth, 4)),
+                payload["timing"]["suffix_update_seconds"],
             ),
             _index_strategy_metrics(
                 "warm_start_full_update", rq_warm_full, embeddings_t1,
                 freeze_depth, warm_full_churn, n_items,
                 _codebook_bytes(rq_warm_full),
+                payload["timing"]["warm_full_codebook_seconds"],
             ),
             _index_strategy_metrics(
                 "ema_streaming_vq", rq_ema, embeddings_t1, freeze_depth,
                 ema_churn, n_items, _codebook_bytes(rq_ema),
+                payload["timing"]["ema_codebook_seconds"],
             ),
             _index_strategy_metrics(
                 "full_retrained", rq_full, embeddings_t1, freeze_depth,
                 full_churn, n_items, _codebook_bytes(rq_full),
+                payload["timing"]["full_codebook_seconds"],
             ),
         ]
         mse_by_strategy = {
@@ -820,35 +867,28 @@ def run_seed(args) -> None:
             model, eval_t1, history_rq, item_rq, embeddings_t1,
             freeze_depth, args.n_beams, args.device, item_prefix_mapping,
         )
+        codebook_update_bytes = (
+            0 if name == "frozen" else
+            _codebook_bytes(item_rq, range(freeze_depth, 4))
+            if name == "stratified" else _codebook_bytes(item_rq)
+        )
         metrics.update({
             "strategy": name,
             "mse": item_rq.mse(embeddings_t1),
             # Keep prefix_churn/items_reindexed as raw aliases for artifact
             # compatibility; papers must identify the alignment convention.
-            "prefix_churn": churn["raw"],
-            "prefix_churn_raw": churn["raw"],
-            "prefix_churn_centroid_aligned": churn["centroid_aligned"],
-            "prefix_churn_assignment_aligned": churn["assignment_aligned"],
-            "prefix_churn_headline": churn["assignment_aligned"],
-            "items_reindexed": int(round(churn["raw"] * n_items)),
-            "items_reindexed_centroid_aligned": int(round(
-                churn["centroid_aligned"] * n_items
-            )),
-            "items_reindexed_assignment_aligned": int(round(
-                churn["assignment_aligned"] * n_items
-            )),
-            "items_reindexed_headline": int(round(
-                churn["assignment_aligned"] * n_items
-            )),
+            **_churn_payload(churn, n_items),
             "consumer_retrained": retrained,
             "consumer_token_relabeling": relabeling,
             "token_relabeling_bytes": int(sum(
                 mapping.nbytes for mapping in (item_prefix_mapping or [])
             )),
-            "codebook_update_bytes": (
-                0 if name == "frozen" else
-                _codebook_bytes(item_rq, range(freeze_depth, 4))
-                if name == "stratified" else _codebook_bytes(item_rq)
+            **_strategy_cost_payload(
+                codebook_update_bytes=codebook_update_bytes,
+                tokenizer_update_seconds=_tokenizer_update_seconds_for_strategy(
+                    name, payload["timing"],
+                ),
+                consumer_retrain_required=False,
             ),
         })
         payload["strategies"].append(metrics)
@@ -898,19 +938,16 @@ def run_seed(args) -> None:
     metrics.update({
         "strategy": "grm_only_retrained_generator",
         "mse": rq_source.mse(embeddings_t1),
-        "prefix_churn": zero_churn["raw"],
-        "prefix_churn_raw": zero_churn["raw"],
-        "prefix_churn_centroid_aligned": zero_churn["centroid_aligned"],
-        "prefix_churn_assignment_aligned": zero_churn["assignment_aligned"],
-        "prefix_churn_headline": zero_churn["assignment_aligned"],
-        "items_reindexed": 0,
-        "items_reindexed_centroid_aligned": 0,
-        "items_reindexed_assignment_aligned": 0,
-        "items_reindexed_headline": 0,
+        **_churn_payload(zero_churn, n_items),
         "consumer_retrained": True,
         "consumer_token_relabeling": "none",
         "token_relabeling_bytes": 0,
-        "codebook_update_bytes": 0,
+        **_strategy_cost_payload(
+            codebook_update_bytes=0,
+            consumer_retrain_seconds=payload["timing"]["grm_generator_seconds"],
+            consumer_training_sequences=len(tok_grm),
+            consumer_retrain_required=True,
+        ),
     })
     payload["strategies"].append(metrics)
     payload["beam_sweep"].extend(evaluate_beam_sweep(
@@ -951,25 +988,17 @@ def run_seed(args) -> None:
     metrics.update({
         "strategy": "full_retrained_generator",
         "mse": rq_full.mse(embeddings_t1),
-        "prefix_churn": churn["raw"],
-        "prefix_churn_raw": churn["raw"],
-        "prefix_churn_centroid_aligned": churn["centroid_aligned"],
-        "prefix_churn_assignment_aligned": churn["assignment_aligned"],
-        "prefix_churn_headline": churn["assignment_aligned"],
-        "items_reindexed": int(round(churn["raw"] * n_items)),
-        "items_reindexed_centroid_aligned": int(round(
-            churn["centroid_aligned"] * n_items
-        )),
-        "items_reindexed_assignment_aligned": int(round(
-            churn["assignment_aligned"] * n_items
-        )),
-        "items_reindexed_headline": int(round(
-            churn["assignment_aligned"] * n_items
-        )),
+        **_churn_payload(churn, n_items),
         "consumer_retrained": True,
         "consumer_token_relabeling": "none",
         "token_relabeling_bytes": 0,
-        "codebook_update_bytes": _codebook_bytes(rq_full),
+        **_strategy_cost_payload(
+            codebook_update_bytes=_codebook_bytes(rq_full),
+            tokenizer_update_seconds=payload["timing"]["full_codebook_seconds"],
+            consumer_retrain_seconds=payload["timing"]["target_generator_seconds"],
+            consumer_training_sequences=len(tok_t1),
+            consumer_retrain_required=True,
+        ),
     })
     payload["strategies"].append(metrics)
     payload["beam_sweep"].extend(evaluate_beam_sweep(
