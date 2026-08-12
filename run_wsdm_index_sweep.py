@@ -22,6 +22,7 @@ from run_wsdm_web_recsys import (
     _index_strategy_metrics,
     _json_default,
     _prefix_churn_metrics,
+    _tier_c_diagnostics,
     _write_json,
     ema_retrain,
     load_cache,
@@ -34,7 +35,9 @@ def run(args) -> None:
         raise FileExistsError(f"output exists: {output}; pass --overwrite")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    embeddings_t0, embeddings_t1, _, _, metadata = load_cache(Path(args.cache))
+    embeddings_t0, embeddings_t1, seqs_t0, eval_t1, metadata = load_cache(
+        Path(args.cache)
+    )
     codes = ARCHITECTURES[args.arch]
     n_items = len(embeddings_t0)
     total_bits = int(sum(round(math.log2(k)) for k in codes))
@@ -156,6 +159,11 @@ def run(args) -> None:
         payload["runs"].append({
             "freeze_depth": freeze_depth,
             "suffix_update_seconds": suffix_seconds,
+            "diagnostics": _tier_c_diagnostics(
+                rq_source, rq_stratified, rq_full,
+                embeddings_t0, embeddings_t1, freeze_depth,
+                seqs_t0, eval_t1,
+            ),
             "stratified_gap_recovery": float(
                 (frozen_mse - mse_by_strategy["stratified"])
                 / max(frozen_mse - full_mse, 1e-12)

@@ -434,11 +434,7 @@ def ema_retrain(rq: RQ, embeddings, decay: float, n_iter: int = 20) -> RQ:
 def _prefix_bucket_metrics(rq: RQ, embeddings, freeze_depth: int) -> dict:
     """Summarize the full catalog partition induced by a prefix."""
     codes = rq.encode(embeddings)[:, :freeze_depth]
-    packed = np.zeros(len(codes), dtype=np.uint64)
-    for stage in range(freeze_depth):
-        packed = packed * np.uint64(rq.K[stage]) + codes[:, stage].astype(
-            np.uint64
-        )
+    packed = _pack_prefix_codes(codes, rq.K[:freeze_depth])
     _, counts = np.unique(packed, return_counts=True)
     probabilities = counts.astype(np.float64) / max(len(codes), 1)
     entropy = float(-np.sum(probabilities * np.log2(probabilities)))
@@ -455,6 +451,281 @@ def _prefix_bucket_metrics(rq: RQ, embeddings, freeze_depth: int) -> dict:
         "prefix_entropy_bits": entropy,
         "effective_prefixes": float(2.0 ** entropy),
     }
+
+
+def _pack_prefix_codes(codes: np.ndarray, sizes) -> np.ndarray:
+    packed = np.zeros(len(codes), dtype=np.uint64)
+    for stage, size in enumerate(sizes):
+        packed = packed * np.uint64(size) + codes[:, stage].astype(np.uint64)
+    return packed
+
+
+def _prefix_subspace_basis(rq: RQ, freeze_depth: int) -> np.ndarray:
+    """Basis for span of frozen-stage centroid differences."""
+    if freeze_depth <= 0:
+        return np.zeros((0, rq.dim), dtype=np.float32)
+    centered = []
+    for stage in range(freeze_depth):
+        centroids = rq.cb[stage].astype(np.float64)
+        centered.append(centroids - centroids.mean(axis=0, keepdims=True))
+    matrix = np.concatenate(centered, axis=0)
+    if matrix.size == 0:
+        return np.zeros((0, rq.dim), dtype=np.float32)
+    _, singular_values, vh = np.linalg.svd(matrix, full_matrices=False)
+    threshold = max(matrix.shape) * np.finfo(np.float64).eps * singular_values[0]
+    rank = int(np.sum(singular_values > threshold))
+    return vh[:rank].astype(np.float32)
+
+
+def _prefix_drift_diagnostics(
+    rq: RQ,
+    embeddings_t0: np.ndarray,
+    embeddings_t1: np.ndarray,
+    freeze_depth: int,
+) -> dict:
+    basis = _prefix_subspace_basis(rq, freeze_depth)
+    drift = embeddings_t1 - embeddings_t0
+    drift_energy = float(np.mean(np.sum(drift * drift, axis=1)))
+    if len(basis):
+        projected = drift @ basis.T
+        prefix_energy = float(np.mean(np.sum(projected * projected, axis=1)))
+    else:
+        prefix_energy = 0.0
+    prefix_energy = min(prefix_energy, drift_energy)
+    drift_norms = np.sqrt(np.sum(drift * drift, axis=1))
+
+    codes_t0 = rq.encode(embeddings_t0)[:, :freeze_depth]
+    codes_t1 = rq.encode(embeddings_t1)[:, :freeze_depth]
+    temporal_crossing = (
+        float(np.any(codes_t0 != codes_t1, axis=1).mean())
+        if freeze_depth else 0.0
+    )
+    return {
+        "xi_s": float(prefix_energy / max(drift_energy, 1e-12)),
+        "prefix_subspace_rank": int(len(basis)),
+        "prefix_subspace_dim_bound": int(sum(k - 1 for k in rq.K[:freeze_depth])),
+        "drift_energy": drift_energy,
+        "prefix_drift_energy": prefix_energy,
+        "orthogonal_drift_energy": float(max(drift_energy - prefix_energy, 0.0)),
+        "prefix_drift_rms": float(math.sqrt(max(prefix_energy, 0.0))),
+        "drift_norm_mean": float(drift_norms.mean()),
+        "drift_norm_p50": float(np.percentile(drift_norms, 50)),
+        "drift_norm_p95": float(np.percentile(drift_norms, 95)),
+        "epsilon_s_temporal": temporal_crossing,
+        "stable_item_fraction": float(1.0 - temporal_crossing),
+    }
+
+
+def _nearest_prefix_margin_diagnostics(
+    rq: RQ,
+    embeddings: np.ndarray,
+    freeze_depth: int,
+    fragile_threshold: float,
+    chunk_size: int = 16384,
+) -> dict:
+    """Distance to the nearest frozen-prefix Voronoi boundary."""
+    if freeze_depth <= 0:
+        return {}
+    residual = embeddings.copy()
+    min_margins = np.full(len(embeddings), np.inf, dtype=np.float32)
+    for stage in range(freeze_depth):
+        centroids = rq.cb[stage].astype(np.float32)
+        assignments = np.empty(len(residual), dtype=np.int64)
+        margins = np.empty(len(residual), dtype=np.float32)
+        c_norm = np.sum(centroids * centroids, axis=1)[None, :]
+        for start in range(0, len(residual), chunk_size):
+            end = min(start + chunk_size, len(residual))
+            block = residual[start:end]
+            distances = (
+                np.sum(block * block, axis=1, keepdims=True)
+                + c_norm
+                - 2.0 * (block @ centroids.T)
+            )
+            nearest_two = np.argpartition(distances, 1, axis=1)[:, :2]
+            row = np.arange(end - start)
+            first = nearest_two[row, 0]
+            second = nearest_two[row, 1]
+            swap = distances[row, second] < distances[row, first]
+            first, second = first.copy(), second.copy()
+            first[swap], second[swap] = second[swap], first[swap]
+            first_dist = distances[row, first]
+            second_dist = distances[row, second]
+            normal_norm = np.linalg.norm(
+                centroids[second] - centroids[first], axis=1,
+            )
+            margins[start:end] = (
+                (second_dist - first_dist) / (2.0 * np.maximum(normal_norm, 1e-12))
+            )
+            assignments[start:end] = first
+        min_margins = np.minimum(min_margins, margins)
+        residual = residual - centroids[assignments]
+
+    finite = min_margins[np.isfinite(min_margins)]
+    if not len(finite):
+        return {}
+    return {
+        "prefix_margin_source_min_mean": float(finite.mean()),
+        "prefix_margin_source_min_p01": float(np.percentile(finite, 1)),
+        "prefix_margin_source_min_p05": float(np.percentile(finite, 5)),
+        "prefix_margin_source_min_p10": float(np.percentile(finite, 10)),
+        "prefix_margin_source_min_p50": float(np.percentile(finite, 50)),
+        "prefix_margin_source_min_p95": float(np.percentile(finite, 95)),
+        "fragile_margin_fraction_at_half_prefix_rms": float(
+            np.mean(finite <= 0.5 * fragile_threshold)
+        ),
+        "fragile_margin_fraction_at_prefix_rms": float(
+            np.mean(finite <= fragile_threshold)
+        ),
+        "fragile_margin_fraction_at_2x_prefix_rms": float(
+            np.mean(finite <= 2.0 * fragile_threshold)
+        ),
+    }
+
+
+def _transition_counts(sequences, prefix_codes, stable_item_mask) -> dict:
+    counts = {}
+    for seq in sequences:
+        if len(seq) < 2:
+            continue
+        for left, right in zip(seq[:-1], seq[1:]):
+            if not (stable_item_mask[left] and stable_item_mask[right]):
+                continue
+            context = int(prefix_codes[left])
+            target = int(prefix_codes[right])
+            counts.setdefault(context, {})
+            counts[context][target] = counts[context].get(target, 0) + 1
+    return counts
+
+
+def _eval_transition_counts(eval_t1, prefix_codes, stable_item_mask) -> dict:
+    counts = {}
+    for _, history, target_item in eval_t1:
+        if not history:
+            continue
+        context_item = history[-1]
+        if not (
+            stable_item_mask[context_item] and stable_item_mask[target_item]
+        ):
+            continue
+        context = int(prefix_codes[context_item])
+        target = int(prefix_codes[target_item])
+        counts.setdefault(context, {})
+        counts[context][target] = counts[context].get(target, 0) + 1
+    return counts
+
+
+def _weighted_transition_tv(source_counts: dict, target_counts: dict) -> dict:
+    total_target = sum(
+        sum(next_counts.values()) for next_counts in target_counts.values()
+    )
+    total_source = sum(
+        sum(next_counts.values()) for next_counts in source_counts.values()
+    )
+    if total_target == 0 or total_source == 0:
+        return {
+            "delta_task_tv_weighted": "",
+            "delta_task_tv_common_contexts": "",
+            "delta_task_context_overlap": "",
+            "delta_task_contexts_source": len(source_counts),
+            "delta_task_contexts_target": len(target_counts),
+            "delta_task_contexts_common": len(set(source_counts) & set(target_counts)),
+            "delta_task_source_transitions": int(total_source),
+            "delta_task_target_transitions": int(total_target),
+        }
+
+    weighted_tv = 0.0
+    common_weighted_tv = 0.0
+    common_target_mass = 0
+    common_contexts = set(source_counts) & set(target_counts)
+    for context, target_next in target_counts.items():
+        target_total = sum(target_next.values())
+        source_next = source_counts.get(context)
+        if source_next is None:
+            tv = 1.0
+        else:
+            source_total = sum(source_next.values())
+            keys = set(source_next) | set(target_next)
+            tv = 0.5 * sum(
+                abs(
+                    source_next.get(key, 0) / source_total
+                    - target_next.get(key, 0) / target_total
+                )
+                for key in keys
+            )
+            common_weighted_tv += target_total * tv
+            common_target_mass += target_total
+        weighted_tv += target_total * tv
+
+    return {
+        "delta_task_tv_weighted": float(weighted_tv / total_target),
+        "delta_task_tv_common_contexts": (
+            float(common_weighted_tv / common_target_mass)
+            if common_target_mass else ""
+        ),
+        "delta_task_context_overlap": float(common_target_mass / total_target),
+        "delta_task_contexts_source": len(source_counts),
+        "delta_task_contexts_target": len(target_counts),
+        "delta_task_contexts_common": len(common_contexts),
+        "delta_task_source_transitions": int(total_source),
+        "delta_task_target_transitions": int(total_target),
+    }
+
+
+def _task_shift_diagnostics(
+    rq: RQ,
+    embeddings_t0: np.ndarray,
+    embeddings_t1: np.ndarray,
+    seqs_t0,
+    eval_t1,
+    freeze_depth: int,
+) -> dict:
+    if seqs_t0 is None or eval_t1 is None or freeze_depth <= 0:
+        return {}
+    codes_t0 = rq.encode(embeddings_t0)[:, :freeze_depth]
+    codes_t1 = rq.encode(embeddings_t1)[:, :freeze_depth]
+    stable_item_mask = np.all(codes_t0 == codes_t1, axis=1)
+    packed_t0 = _pack_prefix_codes(codes_t0, rq.K[:freeze_depth])
+    packed_t1 = _pack_prefix_codes(codes_t1, rq.K[:freeze_depth])
+    source_counts = _transition_counts(seqs_t0, packed_t0, stable_item_mask)
+    target_counts = _eval_transition_counts(eval_t1, packed_t1, stable_item_mask)
+    diagnostics = _weighted_transition_tv(source_counts, target_counts)
+    diagnostics["delta_task_stable_item_fraction"] = float(stable_item_mask.mean())
+    return diagnostics
+
+
+def _tier_c_diagnostics(
+    rq_source: RQ,
+    rq_stratified: RQ,
+    rq_full: RQ,
+    embeddings_t0: np.ndarray,
+    embeddings_t1: np.ndarray,
+    freeze_depth: int,
+    seqs_t0=None,
+    eval_t1=None,
+) -> dict:
+    diagnostics = _prefix_drift_diagnostics(
+        rq_source, embeddings_t0, embeddings_t1, freeze_depth,
+    )
+    diagnostics.update(_nearest_prefix_margin_diagnostics(
+        rq_source, embeddings_t0, freeze_depth,
+        diagnostics["prefix_drift_rms"],
+    ))
+    frozen_mse = rq_source.mse(embeddings_t1)
+    stratified_mse = rq_stratified.mse(embeddings_t1)
+    full_mse = rq_full.mse(embeddings_t1)
+    diagnostics.update({
+        "suffix_repair_residual_mse": float(stratified_mse - full_mse),
+        "suffix_repair_residual_ratio": float(
+            (stratified_mse - full_mse) / max(frozen_mse - full_mse, 1e-12)
+        ),
+        "stratified_gap_recovery_diagnostic": float(
+            (frozen_mse - stratified_mse) / max(frozen_mse - full_mse, 1e-12)
+        ),
+    })
+    diagnostics.update(_task_shift_diagnostics(
+        rq_source, embeddings_t0, embeddings_t1, seqs_t0, eval_t1, freeze_depth,
+    ))
+    return diagnostics
 
 
 def _index_strategy_metrics(name, rq, embeddings, freeze_depth, churn,
@@ -708,6 +979,7 @@ def run_seed(args) -> None:
             "label_alignment_during_training": "none",
         },
         "timing": {},
+        "diagnostics": {},
         "strategies": [],
         "beam_sweep": [],
     }
@@ -758,6 +1030,12 @@ def run_seed(args) -> None:
 
     zero_churn = {"raw": 0.0, "centroid_aligned": 0.0,
                   "assignment_aligned": 0.0}
+    payload["diagnostics"] = _tier_c_diagnostics(
+        rq_source, rq_stratified, rq_full,
+        embeddings_t0, embeddings_t1, freeze_depth,
+        seqs_t0, eval_t1,
+    )
+    _write_json(output, payload)
     if args.index_only:
         payload["configuration"]["mode"] = "full_catalog_index_only"
         payload["strategies"] = [

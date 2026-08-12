@@ -161,8 +161,33 @@ therefore distinguish:
 Paper-facing churn uses `prefix_churn_headline`, which is assignment-optimal
 aligned churn. Bare `prefix_churn` remains a raw-churn compatibility alias.
 
+### Tier-C diagnostics
+
+The retraining-necessity theory is an empirical target, not just prose. Future
+JSON artifacts include a `diagnostics` object and the summarizer emits
+`diagnostic_rows.csv` with:
+
+- `xi_s`: target-minus-source drift energy in the frozen prefix
+  centroid-difference subspace;
+- prefix-margin quantiles and fragile-margin fractions;
+- `epsilon_s_temporal`: source-to-target crossing through the frozen source
+  prefix map;
+- suffix repair residual after stratified adaptation;
+- candidate coverage and `Delta_task` for within-stable-prefix task drift.
+
+`prefix_churn_headline` remains the assignment-aligned migration churn for
+independently updated codebooks. It is not a substitute for
+`epsilon_s_temporal`.
+
+The diagnostic claim is gated on tests and synthetic controls: drift projected
+into the prefix orthogonal complement must have `xi_s` near zero and no
+temporal crossings; drift projected into the prefix subspace must cross; and
+consumer-only drift must raise `Delta_task`/GRM-only lift while geometry and
+interface probes stay low.
+
 `summarize_wsdm_results.py` writes `downstream_rows.csv`, `index_runs.csv`,
-`index_summary.csv`, and `cost_summary.csv` from a result directory.
+`diagnostic_rows.csv`, `index_summary.csv`, and `cost_summary.csv` from a
+result directory.
 
 ## Library
 
