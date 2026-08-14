@@ -9,6 +9,7 @@ INTERVAL_SECONDS=${INTERVAL_SECONDS:-300}
 AVAILABLE_ROOT=${AVAILABLE_ROOT:-$RESULTS_ROOT/wsdm_available_full_queue_20260812}
 AMAZON2023_ROOT=${AMAZON2023_ROOT:-$RESULTS_ROOT/amazon2023_acquire_prepare_index_20260812}
 TIER_C_ROOT=${TIER_C_ROOT:-$RESULTS_ROOT/tier_c_retrain_prediction_20260812}
+AMAZON2023_DOWNSTREAM_ROOT=${AMAZON2023_DOWNSTREAM_ROOT:-$RESULTS_ROOT/amazon2023_downstream_rung_funnel24_20260814}
 
 mkdir -p "$WATCH_ROOT/logs"
 LOG="$WATCH_ROOT/logs/watchdog.log"
@@ -109,6 +110,12 @@ main() {
       "$TIER_C_ROOT/queue/logs/master.pid" \
       "$TIER_C_ROOT/queue/logs/master.log" \
       "Tier-C retrain-prediction queue done"
+    check_queue \
+      "Amazon2023 downstream follow-on queue" \
+      "./run_local_gpu_amazon2023_downstream_full_followon_20260814.sh" \
+      "$AMAZON2023_DOWNSTREAM_ROOT/followon_logs/master.pid" \
+      "$AMAZON2023_DOWNSTREAM_ROOT/followon_logs/master.log" \
+      "Amazon2023 downstream full follow-on done"
     sleep "$INTERVAL_SECONDS"
   done
 }
