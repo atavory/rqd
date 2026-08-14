@@ -26,8 +26,18 @@ RESULTS_ROOT = Path(
         "/data/users/atavory/scratch/wsdm_experiments/results",
     )
 )
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "300"))
+INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "120"))
 PREFIX = os.environ.get("AGENT_PREFIX", "cont_si")
+RECIPIENTS = [
+    name.strip()
+    for name in os.environ.get("RECIPIENTS", "cont_si2,cont_si3").split(",")
+    if name.strip()
+]
+INBOXES = [
+    name.strip()
+    for name in os.environ.get("INBOXES", "to_codex,to_cont_si").split(",")
+    if name.strip()
+]
 
 
 def now_stamp() -> str:
@@ -171,11 +181,11 @@ def build_status(new_messages: list[str]) -> str:
     return f"""{PREFIX}:
 
 from: {PREFIX}
-to: cont_si2
+to: {", ".join(RECIPIENTS)}
 time: {now_human()}
 topic: local status heartbeat
 
-## New Messages Received From cont_si2
+## New Messages Received From Remote Agents
 
 {chr(10).join('- ' + msg for msg in new_messages) if new_messages else 'None this interval.'}
 
@@ -213,32 +223,69 @@ topic: local status heartbeat
 
 
 def post_status(new_messages: list[str]) -> None:
-    out_dir = LOCAL_ROOT / "outbox_to_cont_si2"
+    out_dir = LOCAL_ROOT / "outbox"
     out_dir.mkdir(parents=True, exist_ok=True)
     name = f"{now_stamp()}_from_{PREFIX}_local_status.md"
     path = out_dir / name
     path.write_text(build_status(new_messages))
-    manifold_put(path, f"{MSG_ROOT}/to_cont_si2/{name}")
+    for recipient in RECIPIENTS:
+        manifold_put(path, f"{MSG_ROOT}/to_{recipient}/{name}")
 
 
 def poll_once() -> None:
     seen = load_seen()
-    inbox = LOCAL_ROOT / "inbox_to_cont_si"
     new_messages: list[str] = []
-    for name in manifold_ls(f"{MSG_ROOT}/to_codex"):
-        if name in seen:
-            continue
-        local = inbox / name
-        if manifold_get(f"{MSG_ROOT}/to_codex/{name}", local):
-            seen.add(name)
-            new_messages.append(name)
+    for inbox_name in INBOXES:
+        inbox = LOCAL_ROOT / inbox_name
+        for name in manifold_ls(f"{MSG_ROOT}/{inbox_name}"):
+            key = f"{inbox_name}/{name}"
+            if key in seen:
+                continue
+            local = inbox / name
+            if manifold_get(f"{MSG_ROOT}/{inbox_name}/{name}", local):
+                seen.add(key)
+                new_messages.append(key)
     save_seen(seen)
     post_status(new_messages)
+
+
+def ensure_remote_dirs() -> None:
+    for name in ["to_cont_si", "to_codex", *[f"to_{recipient}" for recipient in RECIPIENTS]]:
+        run(["manifold", "mkdir", "-p", f"{MSG_ROOT}/{name}"], timeout=180)
+
+
+def post_boot_message() -> None:
+    out_dir = LOCAL_ROOT / "outbox"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{now_stamp()}_from_{PREFIX}_coordinator_boot.md"
+    path = out_dir / name
+    path.write_text(
+        f"""{PREFIX}:
+
+from: {PREFIX}
+to: {", ".join(RECIPIENTS)}
+time: {now_human()}
+topic: coordinator boot
+
+Coordinator loop is active.
+
+- messagebox root: `{MSG_ROOT}/`
+- recipients: `{", ".join(RECIPIENTS)}`
+- polled inboxes: `{", ".join(INBOXES)}`
+- interval seconds: `{INTERVAL_SECONDS}`
+
+Reply to either `{MSG_ROOT}/to_cont_si/` or legacy `{MSG_ROOT}/to_codex/`.
+"""
+    )
+    for recipient in RECIPIENTS:
+        manifold_put(path, f"{MSG_ROOT}/to_{recipient}/{name}")
 
 
 def main() -> None:
     log = LOCAL_ROOT / "coordinator.log"
     log.parent.mkdir(parents=True, exist_ok=True)
+    ensure_remote_dirs()
+    post_boot_message()
     while not (LOCAL_ROOT / "STOP").exists():
         try:
             poll_once()
@@ -250,4 +297,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
