@@ -3,6 +3,29 @@
 Public experiment code for maintaining semantic-ID interfaces as embedding
 models and interaction logs evolve.
 
+## Paper-facing analysis contract
+
+This repository is the canonical public source for analysis and run scripts.
+The data Overleaf project stores generated CSV, Markdown, LaTeX-table, and
+plot-data artifacts, plus manifests that record the exact script hash and input
+hashes used to produce them. Paper numbers and plots must be regenerated from
+committed scripts; do not copy session-local calculations into the paper or
+edit generated data artifacts by hand.
+
+Current WSDM paper-analysis generator:
+
+```bash
+python3 make_wsdm_overleaf_analysis.py \
+  --experiment-root /data/users/atavory/scratch/wsdm_experiments \
+  --output-dir /data/users/atavory/scratch/wsdm_experiments/overleaf_data/wsdm_analysis_latest \
+  --hash-inputs
+```
+
+The generated package is mirrored to the data Overleaf directory
+`results/wsdm_2027_paper_analysis/`. A hash-identical provenance copy of the
+generator may appear inside that package, but the public script source is this
+GitHub repository.
+
 ## Setup
 
 ```bash
