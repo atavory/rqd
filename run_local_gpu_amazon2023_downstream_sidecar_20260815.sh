@@ -9,6 +9,8 @@ TMP_ROOT=${TMP_ROOT:-$OUT_ROOT/sidecar_tmp}
 LOG_ROOT=${LOG_ROOT:-$OUT_ROOT/sidecar_logs}
 EPOCHS=${EPOCHS:-50}
 N_BEAMS=${N_BEAMS:-10}
+THREADS=${THREADS:-6}
+ROWS=${ROWS:-clothing:funnel24:1:0:0 home:funnel24:1:0:1}
 
 mkdir -p "$TMP_ROOT" "$LOG_ROOT" "$OUT_ROOT"
 
@@ -110,7 +112,12 @@ run_row() {
   log "sidecar run category=$category arch=$arch fd=$freeze_depth seed=$seed gpu=$gpu tmp_output=$tmp_output"
   (
     cd "$ROOT"
-    CUDA_VISIBLE_DEVICES="$gpu" "$PY" run_wsdm_web_recsys.py \
+    CUDA_VISIBLE_DEVICES="$gpu" \
+      OMP_NUM_THREADS="$THREADS" \
+      MKL_NUM_THREADS="$THREADS" \
+      OPENBLAS_NUM_THREADS="$THREADS" \
+      NUMEXPR_NUM_THREADS="$THREADS" \
+      "$PY" run_wsdm_web_recsys.py \
       --dataset amazon \
       --cache "$cache" \
       --arch "$arch" \
@@ -127,21 +134,36 @@ run_row() {
 
 main() {
   log "Amazon2023 downstream sidecar start"
-  log "tmp_root=$TMP_ROOT out_root=$OUT_ROOT"
+  log "tmp_root=$TMP_ROOT out_root=$OUT_ROOT rows=$ROWS threads=$THREADS"
   echo "$$" >"$LOG_ROOT/sidecar.pid"
 
-  run_row clothing funnel24 1 0 0 >"$LOG_ROOT/clothing_fd1_seed0.log" 2>&1 &
-  local pid0=$!
-  run_row home funnel24 1 0 1 >"$LOG_ROOT/home_fd1_seed0.log" 2>&1 &
-  local pid1=$!
-  log "sidecar workers launched clothing=$pid0 home=$pid1"
+  local pids=()
+  local labels=()
+  local row
+  for row in $ROWS; do
+    IFS=: read -r category arch freeze_depth seed gpu <<<"$row"
+    if [[ -z "$category" || -z "$arch" || -z "$freeze_depth" || -z "$seed" || -z "$gpu" ]]; then
+      echo "bad ROWS entry: $row" >&2
+      exit 2
+    fi
+    local label="${category}_${arch}_fd${freeze_depth}_seed${seed}_gpu${gpu}"
+    run_row "$category" "$arch" "$freeze_depth" "$seed" "$gpu" >"$LOG_ROOT/$label.log" 2>&1 &
+    pids+=("$!")
+    labels+=("$label")
+  done
+  log "sidecar workers launched ${labels[*]} pids=${pids[*]}"
 
-  local status0=0
-  local status1=0
-  wait "$pid0" || status0=$?
-  wait "$pid1" || status1=$?
-  log "sidecar workers finished status0=$status0 status1=$status1"
-  if [[ "$status0" != "0" || "$status1" != "0" ]]; then
+  local failed=0
+  local i
+  for i in "${!pids[@]}"; do
+    local status=0
+    wait "${pids[$i]}" || status=$?
+    log "sidecar worker finished label=${labels[$i]} pid=${pids[$i]} status=$status"
+    if [[ "$status" != "0" ]]; then
+      failed=1
+    fi
+  done
+  if [[ "$failed" != "0" ]]; then
     exit 1
   fi
   log "Amazon2023 downstream sidecar done"
