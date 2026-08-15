@@ -266,6 +266,63 @@ Both:
             log(proc.stdout.strip())
 
 
+def send_required_status(reason: str) -> None:
+    rows = downstream_rows()
+    partials = [
+        f"- {row['artifact']}: {row['strategies']}/9, missing={','.join(row['missing'])}"
+        for row in rows
+        if not row["complete"]
+    ]
+    if not partials:
+        partials = ["- none"]
+    text = f"""cont_si:
+
+from: cont_si
+to: cont_si2, cont_si3
+time: {human()} PDT
+topic: required remote status report
+reason: {reason}
+
+This is a direct mailbox request. Reply under:
+  {MSG_ROOT}/to_cont_si/
+
+Required in the reply:
+- active PIDs and exact commands
+- GPU utilization and memory
+- newest completed result files, with strategy counts where applicable
+- newest partial files and mtimes
+- current artifact tarballs/checksums uploaded under wsdm_remote_results/
+- exact blocker if there is no progress
+- next row/job planned
+
+Current cont_si local state:
+- complete downstream rows: {sum(1 for row in rows if row["complete"])}
+- partial downstream rows: {sum(1 for row in rows if not row["complete"])}
+{chr(10).join(partials)}
+
+cont_si2:
+- Report current Beauty/Tools/Toys fallback state.
+- Upload a fresh snapshot if any rows changed since the last cont_si2 tarball.
+
+cont_si3:
+- Report current DACT/LC-Rec/Reformer state.
+- Report current BTT fallback queue state.
+- Upload a fresh artifact snapshot if DACT logs/checkpoints, LC-Rec eval/checkpoints,
+  or fallback results changed since the last cont_si3 tarballs.
+
+Text-only claims are not enough for final table readiness; changed artifacts must be
+uploaded and named with checksums.
+"""
+    local = LOG_DIR / f"{stamp()}_from_cont_si_required_remote_status.md"
+    local.write_text(text)
+    for recipient in ("cont_si2", "cont_si3"):
+        remote = f"{MSG_ROOT}/to_{recipient}/{local.name}"
+        proc = run(["manifold", "put", str(local), remote], timeout=300)
+        log(f"required status to {recipient}: rc={proc.returncode} remote={remote}")
+        if proc.returncode != 0:
+            log(proc.stdout.strip())
+
+
 def load_seen() -> set[str]:
     path = LOG_DIR / "seen_to_cont_si.json"
     if not path.exists():
@@ -490,6 +547,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=0)
     parser.add_argument("--send-work-orders", action="store_true")
     parser.add_argument("--work-order-every-iterations", type=int, default=0)
+    parser.add_argument("--required-status-every-iterations", type=int, default=0)
     parser.add_argument("--force-upload", action="store_true")
     return parser.parse_args()
 
@@ -509,6 +567,14 @@ def main() -> None:
             and iteration % args.work_order_every_iterations == 0
         ):
             send_work_orders()
+        if (
+            args.required_status_every_iterations
+            and iteration > 1
+            and iteration % args.required_status_every_iterations == 0
+        ):
+            send_required_status(
+                f"scheduled every {args.required_status_every_iterations} iterations"
+            )
         try:
             loop_once(force_upload=args.force_upload and iteration == 1)
         except Exception as exc:
