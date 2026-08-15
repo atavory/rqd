@@ -189,6 +189,44 @@ interface probes stay low.
 `diagnostic_rows.csv`, `index_summary.csv`, and `cost_summary.csv` from a
 result directory.
 
+### Paper-facing analysis and Overleaf artifacts
+
+All paper-facing analysis and plotting for the WSDM run must be regenerated
+from scripts. Do not compute abstract numbers, paper tables, or figures in an
+interactive session.
+
+`make_wsdm_overleaf_analysis.py` is the reproducible paper-facing generator.
+It reads raw JSON/CSV result artifacts, excludes incomplete downstream JSONs
+from headline tables, records partial jobs in coverage reports, and writes an
+Overleaf-ready package containing:
+
+- `manifest.json` with input paths, timestamps, optional input hashes, and
+  Manifold artifact references;
+- normalized CSVs under `csv/`;
+- generated LaTeX tables under `tables/`;
+- PGFPlots snippets under `figures/` backed by CSVs under `plot_data/`;
+- `coverage.md`, which states exactly which results are complete or partial.
+
+Example for the current WSDM run:
+
+```bash
+python3 make_wsdm_overleaf_analysis.py \
+  --experiment-root /data/users/atavory/scratch/wsdm_experiments \
+  --output-dir overleaf_data/wsdm_analysis_latest \
+  --artifact-ref manifold:aai_research_tlv/tree/atavory/wsdm_results_snapshot_20260814_210842.tar.zst#ed6eb768a97dfa6ecc60d5dd7d2cfcd12e2c2fff4aad7df18f079e926cd2c7e3 \
+  --artifact-ref manifold:aai_research_tlv/tree/atavory/wsdm_remote_results/cont_si2/wsdm_remote_results_snapshot_20260814T143740_cont_si2.tar.zst \
+  --artifact-ref manifold:aai_research_tlv/tree/atavory/wsdm_remote_results/cont_si3/cont_si3_dact_tools_artifact_20260814T215749.tar.zst \
+  --artifact-ref manifold:aai_research_tlv/tree/atavory/wsdm_remote_results/cont_si3/cont_si3_lcrec_qwen_adapter_snapshot_20260814T220200.tar.zst
+```
+
+`run_wsdm_paper_completion_loop_20260815.py` is the long-running coordinator
+for the same package. It polls local downstream JSONs and remote Manifold
+artifact directories, regenerates the Overleaf-ready analysis package when the
+completion signature changes, uploads a verified tarball to Manifold, and
+syncs the generated data package/snippets into the two Overleaf Git remotes.
+It uses `~/.mrgitties/mrgitties.sock` only as a fallback when direct Overleaf
+HTTPS push is blocked by the local proxy.
+
 ### Tier-C retraining prediction scripts
 
 `run_tier_c_retrain_prediction.py` is the public synthetic-control runner for

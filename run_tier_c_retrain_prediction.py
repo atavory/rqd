@@ -106,6 +106,8 @@ def _scenario_target(
         drift = _project(raw, basis)
     else:
         drift = raw - _project(raw, basis)
+        if scenario == "suffix_capacity":
+            target_rms *= 4.0
 
     return (source + _normalize_drift(drift, target_rms)).astype(np.float32)
 

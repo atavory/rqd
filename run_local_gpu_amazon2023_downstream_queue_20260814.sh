@@ -48,10 +48,23 @@ downstream_ok() {
 import json
 import sys
 
+EXPECTED = {
+    "frozen",
+    "stratified",
+    "warm_start_full_old_generator",
+    "ema_streaming_vq_old_generator",
+    "full_old_generator",
+    "full_old_generator_centroid_relabel",
+    "full_old_generator_assignment_relabel",
+    "grm_only_retrained_generator",
+    "full_retrained_generator",
+}
+
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 strategies = payload.get("strategies")
-raise SystemExit(0 if isinstance(strategies, list) and len(strategies) > 0 else 1)
+names = {row.get("strategy") for row in strategies or []}
+raise SystemExit(0 if EXPECTED <= names else 1)
 PY
 }
 
@@ -150,4 +163,3 @@ main() {
 }
 
 main "$@"
-

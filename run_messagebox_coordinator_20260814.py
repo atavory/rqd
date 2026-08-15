@@ -38,6 +38,17 @@ INBOXES = [
     for name in os.environ.get("INBOXES", "to_codex,to_cont_si").split(",")
     if name.strip()
 ]
+EXPECTED_DOWNSTREAM_STRATEGIES = {
+    "frozen",
+    "stratified",
+    "warm_start_full_old_generator",
+    "ema_streaming_vq_old_generator",
+    "full_old_generator",
+    "full_old_generator_centroid_relabel",
+    "full_old_generator_assignment_relabel",
+    "grm_only_retrained_generator",
+    "full_retrained_generator",
+}
 
 
 def now_stamp() -> str:
@@ -117,7 +128,9 @@ def complete_json_count(root: Path, pattern: str, downstream: bool = False) -> t
         try:
             payload = json.loads(path.read_text())
             if downstream:
-                ok = isinstance(payload.get("strategies"), list) and bool(payload["strategies"])
+                strategies = payload.get("strategies") or []
+                names = {row.get("strategy") for row in strategies}
+                ok = EXPECTED_DOWNSTREAM_STRATEGIES <= names
             else:
                 runs = payload.get("runs") or []
                 ok = sum(1 for row in runs if row.get("strategies")) >= 3
@@ -159,8 +172,40 @@ def amazon2023_index_status() -> str:
 
 def downstream_status() -> str:
     root = RESULTS_ROOT / "amazon2023_downstream_rung_funnel24_20260814"
-    complete, partial = complete_json_count(root, "downstream_*.json", downstream=True)
-    return f"complete downstream files: {complete}\npartial: {partial}"
+    rows: list[str] = []
+    complete = 0
+    partial = 0
+    for path in sorted(root.glob("downstream_*.json")):
+        try:
+            payload = json.loads(path.read_text())
+            strategies = payload.get("strategies") or []
+            names = {row.get("strategy") for row in strategies}
+            is_complete = EXPECTED_DOWNSTREAM_STRATEGIES <= names
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime))
+            if is_complete:
+                complete += 1
+            else:
+                partial += 1
+                recent = ",".join(
+                    str(row.get("strategy"))
+                    for row in strategies[-3:]
+                    if row.get("strategy")
+                )
+                rows.append(
+                    f"- {path.name}: {len(strategies)}/9 strategies, "
+                    f"mtime={mtime}, recent=[{recent}]"
+                )
+        except Exception as exc:
+            partial += 1
+            rows.append(f"- {path.name}: unreadable ({exc})")
+    lines = [
+        f"complete downstream files: {complete}",
+        f"partial downstream files: {partial}",
+    ]
+    if rows:
+        lines.append("partial details:")
+        lines.extend(rows)
+    return "\n".join(lines)
 
 
 def build_status(new_messages: list[str]) -> str:
