@@ -208,6 +208,54 @@ def downstream_status() -> str:
     return "\n".join(lines)
 
 
+def sidecar_downstream_status() -> str:
+    root = (
+        RESULTS_ROOT
+        / "amazon2023_downstream_rung_funnel24_20260814"
+        / "sidecar_tmp"
+    )
+    if not root.exists():
+        return "sidecar temp directory missing"
+
+    rows: list[str] = []
+    complete = 0
+    partial = 0
+    for path in sorted(root.glob("downstream_*.json")):
+        try:
+            payload = json.loads(path.read_text())
+            strategies = payload.get("strategies") or []
+            names = {row.get("strategy") for row in strategies}
+            is_complete = EXPECTED_DOWNSTREAM_STRATEGIES <= names
+            mtime = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)
+            )
+            if is_complete:
+                complete += 1
+            else:
+                partial += 1
+            recent = ",".join(
+                str(row.get("strategy"))
+                for row in strategies[-3:]
+                if row.get("strategy")
+            )
+            rows.append(
+                f"- {path.name}: {len(strategies)}/9 strategies, "
+                f"complete={is_complete}, mtime={mtime}, recent=[{recent}]"
+            )
+        except Exception as exc:
+            partial += 1
+            rows.append(f"- {path.name}: unreadable ({exc})")
+
+    lines = [
+        f"sidecar temp complete files: {complete}",
+        f"sidecar temp partial files: {partial}",
+    ]
+    if rows:
+        lines.append("sidecar temp details:")
+        lines.extend(rows)
+    return "\n".join(lines)
+
+
 def build_status(new_messages: list[str]) -> str:
     gpu = shell(
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
@@ -216,7 +264,7 @@ def build_status(new_messages: list[str]) -> str:
     )
     processes = shell(
         "ps -p 1244952,1760846,1961481 -o pid,ppid,etime,stat,pcpu,pmem,cmd 2>/dev/null; "
-        "pgrep -af 'run_wsdm_index_sweep.py|run_wsdm_web_recsys.py|run_local_gpu_amazon2023_downstream_queue|run_tier_c_retrain_prediction_queue|run_amazon2023_acquire_prepare_index_queue' || true",
+        "pgrep -af 'run_wsdm_index_sweep.py|run_wsdm_web_recsys.py|run_local_gpu_amazon2023_downstream_queue|run_local_gpu_amazon2023_downstream_sidecar|run_tier_c_retrain_prediction_queue|run_amazon2023_acquire_prepare_index_queue' || true",
         timeout=30,
     )
     tier_c_predictions = shell(
@@ -256,6 +304,12 @@ topic: local status heartbeat
 
 ```text
 {downstream_status()}
+```
+
+## Local Amazon2023 Downstream Sidecar Temp
+
+```text
+{sidecar_downstream_status()}
 ```
 
 ## Tier-C Predictions
