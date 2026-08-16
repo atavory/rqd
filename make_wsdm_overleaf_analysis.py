@@ -1216,7 +1216,7 @@ def _markdown_table(rows: list[dict], fields: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _readme(output_dir: Path, args: argparse.Namespace) -> str:
+def _readme(output_dir: Path, args) -> str:
     command = " ".join([
         "python3",
         "scripts/make_wsdm_overleaf_analysis.py",
@@ -1262,7 +1262,7 @@ def _readme(output_dir: Path, args: argparse.Namespace) -> str:
     ])
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--experiment-root",
