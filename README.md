@@ -33,7 +33,7 @@ pip install -r requirements.txt
 ```
 
 The committed producer runs on CPU and additionally uses CPU PyTorch for the
-downstream consumer. A batched CUDA RQ/k-means backend is planned for the
+downstream model. A batched CUDA RQ/k-means backend is planned for the
 larger WSDM matrix; GPU results are not interchangeable with the committed CPU
 path until parity tests pass.
 
@@ -46,21 +46,21 @@ five-core benchmark. It provides:
 - deterministic temporal data preparation and immutable numeric caches;
 - funnel and matched-bit uniform residual quantizers;
 - freeze-depth and beam-count sweeps;
-- frozen, suffix-adapted, full-retrain/old-consumer, and
-  full-retrain/rebuilt-consumer strategies;
+- frozen, suffix-adapted, full-retrain/old-model, and
+  full-retrain/rebuilt-model strategies;
 - warm-start-full, EMA/streaming-VQ, and GRM-only comparison baselines;
 - centroid-Hungarian and assignment-optimal global relabeling baselines for
-  the old consumer, testing whether token permutation alone explains failure;
+  the old model, testing whether token permutation alone explains failure;
 - HR/NDCG/Recall at standard cutoffs, routing coverage, candidate work, MSE,
   prefix churn, reindex counts, and codebook-update size in one JSON artifact
   per seed;
 - raw token churn together with centroid-Hungarian and assignment-optimal
   label-aligned churn, so arbitrary k-means token permutations are not
   mistaken for genuine interface changes.
-- per-strategy cost-axis fields: tokenizer update seconds, consumer retrain
+- per-strategy cost-axis fields: tokenizer update seconds, downstream-model retrain
   seconds, training-sequence counts, ID-migration flags, and update wall time.
 - an `--index-only` mode for full-catalog reconstruction, aligned churn, and
-  prefix-bucket statistics without the much smaller sampled consumer workload.
+  prefix-bucket statistics without the much smaller sampled model workload.
 
 Variable-length histories are trained in exact-length batches, so padding never
 enters the model or loss. MovieLens uses shared-basis alignment plus global RMS
@@ -128,9 +128,9 @@ python3 run_wsdm_index_sweep.py \
 
 The WSDM-scale protocol evaluates six full catalogs with five seeds and all
 three freeze depths, plus a separate multi-million-item Amazon Books stress
-test and focused architecture/consumer subsets. The larger raw matrix is
+test and focused architecture/downstream-model subsets. The larger raw matrix is
 reported compactly: one dataset-and-scale table, one aggregate full-catalog
-table, and one aggregate downstream-consumer table. Detailed rows remain in
+table, and one aggregate downstream-model table. Detailed rows remain in
 the companion artifact rather than becoming one paper table per dataset.
 
 Run one independently reproducible seed:
@@ -164,7 +164,7 @@ Every full-retrain result therefore records three conventions:
 Raw churn alone is diagnostic and must not be reported as evidence of a
 vocabulary migration without the aligned controls.
 
-The downstream runner also evaluates the unchanged old consumer against the
+The downstream runner also evaluates the unchanged old model against the
 fully retrained catalog after applying each global mapping to the retrained
 prefix tokens. If either baseline restores routing, the failure is attributable
 to a removable label permutation rather than genuine interface reassignment.
@@ -175,8 +175,9 @@ The WSDM comparison is not a best-NDCG-at-any-cost bakeoff. JSON and CSV rows
 therefore distinguish:
 
 - `tokenizer_update_seconds`: codebook maintenance cost for the strategy;
-- `consumer_retrain_seconds` and `consumer_training_sequences`: downstream GRM
-  retraining cost, nonzero for GRM-only and rebuilt-consumer baselines;
+- legacy raw keys `consumer_retrain_seconds` and `consumer_training_sequences`:
+  downstream GRM retraining cost, nonzero for GRM-only and rebuilt-model
+  baselines;
 - `id_migration_required` / `serving_index_rebuild_required`: whether retained
   item IDs must move under assignment-aligned churn;
 - `update_wall_seconds`: tokenizer update plus downstream retrain cost.
@@ -205,7 +206,7 @@ independently updated codebooks. It is not a substitute for
 The diagnostic claim is gated on tests and synthetic controls: drift projected
 into the prefix orthogonal complement must have `xi_s` near zero and no
 temporal crossings; drift projected into the prefix subspace must cross; and
-consumer-only drift must raise `Delta_task`/GRM-only lift while geometry and
+downstream-model-only drift must raise `Delta_task`/GRM-only lift while geometry and
 interface probes stay low.
 
 `summarize_wsdm_results.py` writes `downstream_rows.csv`, `index_runs.csv`,
@@ -261,8 +262,8 @@ cheapest sufficient update rung:
 - `suffix_capacity`: the suffix cannot repair the drift at the current rate;
 - `interface_drift`: prefix routes cross, so selective/full migration is
   required;
-- `consumer_only`: geometry and routing stay stable, but GRM/consumer retrain
-  is required.
+- legacy synthetic key `consumer_only`: geometry and routing stay stable, but
+  GRM/model retrain is required.
 
 Example:
 

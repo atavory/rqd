@@ -42,13 +42,13 @@ PLOT_STRATEGIES = [
 STRATEGY_LABELS = {
     "frozen": "Frozen",
     "stratified": "Suffix-only",
-    "warm_start_full_old_generator": "Warm full, old consumer",
-    "ema_streaming_vq_old_generator": "EMA VQ, old consumer",
-    "full_old_generator": "Full, old consumer",
+    "warm_start_full_old_generator": "Warm full, old model",
+    "ema_streaming_vq_old_generator": "EMA VQ, old model",
+    "full_old_generator": "Full, old model",
     "full_old_generator_centroid_relabel": "Full + centroid relabel",
     "full_old_generator_assignment_relabel": "Full + assignment relabel",
     "grm_only_retrained_generator": "GRM-only retrain",
-    "full_retrained_generator": "Full + new consumer",
+    "full_retrained_generator": "Full + new model",
 }
 
 DEFAULT_RESULTS = [
@@ -66,6 +66,13 @@ DEFAULT_TIER_C_SYNTHETIC = (
     "tier_c_synthetic_retrain_predictions_v2.csv"
 )
 
+LEGACY_LABEL_ALIASES = {
+    "consumer_retrain": "model_retrain",
+    "keep_consumer": "keep_model",
+    "suffix_plus_consumer_retrain": "suffix_plus_model_retrain",
+    "consumer_only": "model_only",
+}
+
 
 def _read_json(path: Path) -> dict:
     with path.open() as handle:
@@ -77,6 +84,10 @@ def _read_csv(path: Path) -> list[dict]:
         return []
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _paper_label(value: str) -> str:
+    return LEGACY_LABEL_ALIASES.get(value, value)
 
 
 def _write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
@@ -274,10 +285,10 @@ def _collect_downstream(result_dirs: list[Path]) -> tuple[list[dict], list[dict]
                     "codebook_update_bytes": strategy.get(
                         "codebook_update_bytes", ""
                     ),
-                    "consumer_retrain_seconds": strategy.get(
+                    "model_retrain_seconds": strategy.get(
                         "consumer_retrain_seconds", ""
                     ),
-                    "consumer_training_sequences": strategy.get(
+                    "model_training_sequences": strategy.get(
                         "consumer_training_sequences", ""
                     ),
                     "update_wall_seconds": strategy.get("update_wall_seconds", ""),
@@ -422,11 +433,11 @@ def _downstream_headlines(rows: list[dict]) -> list[dict]:
             "best_zero_migration_ndcg_at_10": best_zero.get("ndcg_at_10", ""),
             "assignment_relabel_ndcg_at_10": assignment.get("ndcg_at_10", ""),
             "grm_only_ndcg_at_10": grm.get("ndcg_at_10", ""),
-            "full_new_consumer_ndcg_at_10": full_ndcg,
-            "full_new_consumer_churn": full_new.get(
+            "full_new_model_ndcg_at_10": full_ndcg,
+            "full_new_model_churn": full_new.get(
                 "prefix_churn_headline", ""
             ),
-            "full_new_consumer_update_seconds": full_new.get(
+            "full_new_model_update_seconds": full_new.get(
                 "update_wall_seconds", ""
             ),
         })
@@ -489,7 +500,7 @@ def _tier_c_summary(real_rows: list[dict], synthetic_rows: list[dict]) -> dict:
     ]
     synthetic_by_scenario = defaultdict(list)
     for row in synthetic_rows:
-        scenario = row.get("scenario", "")
+        scenario = _paper_label(row.get("scenario", ""))
         if not scenario:
             continue
         match = row.get("matches_expected_regime", "").lower() == "true"
@@ -538,17 +549,17 @@ def _tier_c_predict(row: dict, thresholds: dict) -> dict:
         )
         else "stable_interface"
     )
-    consumer_action = (
-        "consumer_retrain"
+    model_action = (
+        "model_retrain"
         if delta_task >= thresholds["delta_task_tol"]
-        else "keep_consumer"
+        else "keep_model"
     )
 
     if interface_action != "stable_interface":
         rung = "selective_or_full_migration"
-    elif consumer_action == "consumer_retrain" and reconstruction_action == "suffix_only":
-        rung = "suffix_plus_consumer_retrain"
-    elif consumer_action == "consumer_retrain":
+    elif model_action == "model_retrain" and reconstruction_action == "suffix_only":
+        rung = "suffix_plus_model_retrain"
+    elif model_action == "model_retrain":
         rung = "grm_only"
     else:
         rung = reconstruction_action
@@ -556,13 +567,15 @@ def _tier_c_predict(row: dict, thresholds: dict) -> dict:
     return {
         "predicted_reconstruction_action": reconstruction_action,
         "predicted_interface_action": interface_action,
-        "predicted_consumer_action": consumer_action,
+        "predicted_model_action": model_action,
         "predicted_cheapest_rung": rung,
     }
 
 
 def _tier_c_match(row: dict, prediction: dict) -> bool:
-    expected = row.get("expected_regime", "")
+    expected = _paper_label(row.get("expected_regime", ""))
+    if expected == "model_only":
+        expected = "grm_only"
     if not expected:
         return False
     if expected == "widen_suffix_or_full_tokenizer":
@@ -669,8 +682,12 @@ def _tier_c_identifiability(synthetic_rows: list[dict]) -> list[dict]:
 
     conflicts = []
     for group_id, (_, group) in enumerate(sorted(grouped.items())):
-        labels = sorted({row.get("expected_regime", "") for row in group})
-        scenarios = sorted({row.get("scenario", "") for row in group})
+        labels = sorted({
+            _paper_label(row.get("expected_regime", "")) for row in group
+        })
+        scenarios = sorted({
+            _paper_label(row.get("scenario", "")) for row in group
+        })
         if len(labels) <= 1:
             continue
         conflicts.append({
@@ -783,7 +800,7 @@ def _abstract_readiness_rows(
     full_new_beats_frozen = sum(
         1 for row in downstream_headlines
         if (
-            _float(row.get("full_new_consumer_ndcg_at_10"), -1.0)
+            _float(row.get("full_new_model_ndcg_at_10"), -1.0)
             > _float(row.get("frozen_ndcg_at_10"), -1.0)
         )
     )
@@ -862,10 +879,10 @@ def _abstract_readiness_rows(
             ),
         },
         {
-            "claim": "full_consumer_ceiling",
+            "claim": "full_model_ceiling",
             "status": "ready_with_scope" if downstream_ready else "missing",
             "evidence": (
-                f"full new-consumer retraining beats frozen in "
+                f"full new-model retraining beats frozen in "
                 f"{full_new_beats_frozen}/{len(downstream_headlines)} headline rows"
             ),
             "caveat": (
@@ -910,7 +927,7 @@ def _downstream_tex(headlines: list[dict]) -> str:
         r"\toprule",
         (
             "Dataset & FD & Frozen & Suffix-only & Lift & Churn & "
-            r"Best zero-migration & Full+new consumer \\"
+            r"Best zero-migration & Full+new model \\"
         ),
         r"\midrule",
     ]
@@ -924,7 +941,7 @@ def _downstream_tex(headlines: list[dict]) -> str:
                 _fmt_pct(row["suffix_lift_rel"]),
                 _fmt_pct(row["suffix_churn"]),
                 _fmt(row["best_zero_migration_ndcg_at_10"]),
-                _fmt(row["full_new_consumer_ndcg_at_10"]),
+                _fmt(row["full_new_model_ndcg_at_10"]),
             ]) + r" \\"
         )
     lines.extend([
@@ -1155,7 +1172,7 @@ def _plot_tex(downstream_ticks: list[int], tier_c_ticks: list[int]) -> dict[str,
             r"\addplot table[x=x,y=ndcg_at_10,col sep=comma] "
             r"{plot_data/downstream_ndcg10_full_retrained_generator.csv};"
         ),
-        r"\legend{Frozen,Suffix-only,Full+new consumer}",
+        r"\legend{Frozen,Suffix-only,Full+new model}",
         r"\end{axis}",
         r"\end{tikzpicture}",
         "",
@@ -1353,8 +1370,8 @@ def main() -> None:
             "prefix_churn_headline",
             "items_reindexed_headline",
             "codebook_update_bytes",
-            "consumer_retrain_seconds",
-            "consumer_training_sequences",
+            "model_retrain_seconds",
+            "model_training_sequences",
             "update_wall_seconds",
             "xi_s",
             "epsilon_s_temporal",
@@ -1381,9 +1398,9 @@ def main() -> None:
             "best_zero_migration_ndcg_at_10",
             "assignment_relabel_ndcg_at_10",
             "grm_only_ndcg_at_10",
-            "full_new_consumer_ndcg_at_10",
-            "full_new_consumer_churn",
-            "full_new_consumer_update_seconds",
+            "full_new_model_ndcg_at_10",
+            "full_new_model_churn",
+            "full_new_model_update_seconds",
         ],
     )
     _write_csv(
