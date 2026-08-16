@@ -887,7 +887,7 @@ def _abstract_readiness_rows(
             ),
             "caveat": (
                 "Full retraining is an upper-cost comparator, not the zero-migration "
-                "deployment path."
+                "serving path."
             ),
         },
         {

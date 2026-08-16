@@ -156,7 +156,7 @@ start from the source codebook. Its integer cluster labels are arbitrary.
 Every full-retrain result therefore records three conventions:
 
 - `prefix_churn_raw`: direct token inequality;
-- `prefix_churn_centroid_aligned`: a deployable global token permutation from
+- `prefix_churn_centroid_aligned`: a production global token permutation from
   minimum-cost centroid matching;
 - `prefix_churn_assignment_aligned`: the maximum-agreement global permutation
   on retained catalog items, providing a lower bound after relabeling.
