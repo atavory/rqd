@@ -357,6 +357,77 @@ def _collect_bounded_candidate(result_dirs: list[Path]) -> list[dict]:
                     "uncapped_candidate_count_p95": result.get(
                         "uncapped_candidate_count_p95", ""
                     ),
+                    "items_returned_mean": result.get("items_returned_mean", ""),
+                    "items_returned_p50": result.get("items_returned_p50", ""),
+                    "items_returned_p95": result.get("items_returned_p95", ""),
+                    "items_accessed_mean": result.get("items_accessed_mean", ""),
+                    "items_accessed_p50": result.get("items_accessed_p50", ""),
+                    "items_accessed_p95": result.get("items_accessed_p95", ""),
+                    "candidate_pool_truncated_fraction": result.get(
+                        "candidate_pool_truncated_fraction", ""
+                    ),
+                    "query_milliseconds": result.get("query_milliseconds", ""),
+                    "evaluation_seconds": result.get("evaluation_seconds", ""),
+                })
+    return rows
+
+
+def _collect_candidate_grid(result_dirs: list[Path]) -> list[dict]:
+    rows = []
+    for result_dir in result_dirs:
+        for path in sorted(result_dir.glob("downstream_*.json")):
+            payload = _read_json(path)
+            config = payload.get("configuration", {})
+            for result in payload.get("candidate_grid_sweep", []):
+                rows.append({
+                    "artifact": path.name,
+                    "result_dir": str(result_dir),
+                    "dataset": _dataset_name(payload),
+                    "arch": config.get("arch", ""),
+                    "codebook_sizes": _codebook_sizes(config),
+                    "total_bits": config.get("total_bits", ""),
+                    "freeze_depth": config.get("freeze_depth", ""),
+                    "seed": config.get("seed", ""),
+                    "strategy": result.get("strategy", ""),
+                    "n_eval": result.get("n_eval", ""),
+                    "n_beams": result.get("n_beams", ""),
+                    "candidate_budget": result.get("candidate_budget", ""),
+                    "candidate_budget_mode": result.get(
+                        "candidate_budget_mode", ""
+                    ),
+                    "candidate_budget_exact_scan_simulation": result.get(
+                        "candidate_budget_exact_scan_simulation", ""
+                    ),
+                    "ndcg_at_10": result.get("ndcg_at_10", ""),
+                    "ndcg_at_20": result.get("ndcg_at_20", ""),
+                    "recall_at_10": result.get("recall_at_10", ""),
+                    "recall_at_20": result.get("recall_at_20", ""),
+                    "recall_at_50": result.get("recall_at_50", ""),
+                    "recall_at_200": result.get("recall_at_200", ""),
+                    "routing_coverage": result.get("routing_coverage", ""),
+                    "uncapped_routing_coverage": result.get(
+                        "uncapped_routing_coverage", ""
+                    ),
+                    "candidate_count_mean": result.get(
+                        "candidate_count_mean", ""
+                    ),
+                    "candidate_count_p50": result.get("candidate_count_p50", ""),
+                    "candidate_count_p95": result.get("candidate_count_p95", ""),
+                    "uncapped_candidate_count_mean": result.get(
+                        "uncapped_candidate_count_mean", ""
+                    ),
+                    "uncapped_candidate_count_p50": result.get(
+                        "uncapped_candidate_count_p50", ""
+                    ),
+                    "uncapped_candidate_count_p95": result.get(
+                        "uncapped_candidate_count_p95", ""
+                    ),
+                    "items_returned_mean": result.get("items_returned_mean", ""),
+                    "items_returned_p50": result.get("items_returned_p50", ""),
+                    "items_returned_p95": result.get("items_returned_p95", ""),
+                    "items_accessed_mean": result.get("items_accessed_mean", ""),
+                    "items_accessed_p50": result.get("items_accessed_p50", ""),
+                    "items_accessed_p95": result.get("items_accessed_p95", ""),
                     "candidate_pool_truncated_fraction": result.get(
                         "candidate_pool_truncated_fraction", ""
                     ),
@@ -1311,6 +1382,8 @@ def _readme(output_dir: Path, args) -> str:
         "- `coverage.md`: complete/partial result inventory.",
         "- `abstract_readiness.md`: generated claim scope and readiness notes.",
         "- `csv/`: normalized row-level and headline CSVs.",
+        "- `csv/bounded_candidate_rows.csv`: returned-candidate budget rows.",
+        "- `csv/candidate_grid_rows.csv`: beam-by-budget candidate-work rows.",
         "- `tables/`: generated LaTeX tables.",
         "- `plot_data/`: CSV inputs for generated figures.",
         "- `figures/`: PGFPlots snippets that read `plot_data/`.",
@@ -1381,6 +1454,7 @@ def main() -> None:
 
     downstream_rows, downstream_coverage = _collect_downstream(result_dirs)
     bounded_candidate_rows = _collect_bounded_candidate(result_dirs)
+    candidate_grid_rows = _collect_candidate_grid(result_dirs)
     index_rows, index_coverage = _collect_index(result_dirs)
     real_tier_c_rows = _read_csv(tier_c_real)
     synthetic_tier_c_rows = _read_csv(tier_c_synthetic)
@@ -1495,6 +1569,55 @@ def main() -> None:
             "uncapped_candidate_count_mean",
             "uncapped_candidate_count_p50",
             "uncapped_candidate_count_p95",
+            "items_returned_mean",
+            "items_returned_p50",
+            "items_returned_p95",
+            "items_accessed_mean",
+            "items_accessed_p50",
+            "items_accessed_p95",
+            "candidate_pool_truncated_fraction",
+            "query_milliseconds",
+            "evaluation_seconds",
+        ],
+    )
+    _write_csv(
+        output_dir / "csv/candidate_grid_rows.csv",
+        candidate_grid_rows,
+        [
+            "artifact",
+            "result_dir",
+            "dataset",
+            "arch",
+            "codebook_sizes",
+            "total_bits",
+            "freeze_depth",
+            "seed",
+            "strategy",
+            "n_eval",
+            "n_beams",
+            "candidate_budget",
+            "candidate_budget_mode",
+            "candidate_budget_exact_scan_simulation",
+            "ndcg_at_10",
+            "ndcg_at_20",
+            "recall_at_10",
+            "recall_at_20",
+            "recall_at_50",
+            "recall_at_200",
+            "routing_coverage",
+            "uncapped_routing_coverage",
+            "candidate_count_mean",
+            "candidate_count_p50",
+            "candidate_count_p95",
+            "uncapped_candidate_count_mean",
+            "uncapped_candidate_count_p50",
+            "uncapped_candidate_count_p95",
+            "items_returned_mean",
+            "items_returned_p50",
+            "items_returned_p95",
+            "items_accessed_mean",
+            "items_accessed_p50",
+            "items_accessed_p95",
             "candidate_pool_truncated_fraction",
             "query_milliseconds",
             "evaluation_seconds",
@@ -1730,6 +1853,7 @@ def main() -> None:
             "downstream_headline_rows": len(headlines),
             "downstream_rows": len(downstream_rows),
             "bounded_candidate_rows": len(bounded_candidate_rows),
+            "candidate_grid_rows": len(candidate_grid_rows),
             "index_rows": len(index_rows),
             "tier_c_real_rows": tier_c["real_rows"],
             "tier_c_synthetic_rows": tier_c["synthetic_rows"],

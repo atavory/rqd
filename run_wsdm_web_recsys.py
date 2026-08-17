@@ -931,17 +931,25 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             conditional_dcg[cutoff] / max(coverage, 1)
         )
     if len(candidate_counts):
+        candidate_mean = float(candidate_counts.mean())
+        candidate_p50 = float(np.percentile(candidate_counts, 50))
+        candidate_p95 = float(np.percentile(candidate_counts, 95))
+        uncapped_mean = float(uncapped_candidate_counts.mean())
+        uncapped_p50 = float(np.percentile(uncapped_candidate_counts, 50))
+        uncapped_p95 = float(np.percentile(uncapped_candidate_counts, 95))
         metrics.update({
-            "candidate_count_mean": float(candidate_counts.mean()),
-            "candidate_count_p50": float(np.percentile(candidate_counts, 50)),
-            "candidate_count_p95": float(np.percentile(candidate_counts, 95)),
-            "uncapped_candidate_count_mean": float(uncapped_candidate_counts.mean()),
-            "uncapped_candidate_count_p50": float(np.percentile(
-                uncapped_candidate_counts, 50,
-            )),
-            "uncapped_candidate_count_p95": float(np.percentile(
-                uncapped_candidate_counts, 95,
-            )),
+            "candidate_count_mean": candidate_mean,
+            "candidate_count_p50": candidate_p50,
+            "candidate_count_p95": candidate_p95,
+            "uncapped_candidate_count_mean": uncapped_mean,
+            "uncapped_candidate_count_p50": uncapped_p50,
+            "uncapped_candidate_count_p95": uncapped_p95,
+            "items_returned_mean": candidate_mean,
+            "items_returned_p50": candidate_p50,
+            "items_returned_p95": candidate_p95,
+            "items_accessed_mean": uncapped_mean,
+            "items_accessed_p50": uncapped_p50,
+            "items_accessed_p95": uncapped_p95,
         })
     else:
         metrics.update({
@@ -951,6 +959,12 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             "uncapped_candidate_count_mean": 0.0,
             "uncapped_candidate_count_p50": 0.0,
             "uncapped_candidate_count_p95": 0.0,
+            "items_returned_mean": 0.0,
+            "items_returned_p50": 0.0,
+            "items_returned_p95": 0.0,
+            "items_accessed_mean": 0.0,
+            "items_accessed_p50": 0.0,
+            "items_accessed_p95": 0.0,
         })
     return metrics
 
@@ -994,6 +1008,191 @@ def evaluate_candidate_budget_sweep(model, eval_t1, history_rq, item_rq,
     return rows
 
 
+def evaluate_candidate_grid_sweep(model, eval_t1, history_rq, item_rq,
+                                  embeddings, freeze_depth, beam_values,
+                                  budget_values, device, strategy,
+                                  item_prefix_mapping=None):
+    if not beam_values or not budget_values:
+        return []
+
+    histories = [history for _, history, _ in eval_t1]
+    targets = [target for _, _, target in eval_t1]
+    history_codes = history_rq.encode(embeddings)
+    item_codes_raw = item_rq.encode(embeddings)
+    item_decoded = item_rq.decode_codes(item_codes_raw)
+    item_codes = _apply_prefix_mapping(item_codes_raw, item_prefix_mapping)
+
+    prefix_to_items = {}
+    for item_id, row in enumerate(item_codes[:, :freeze_depth]):
+        prefix_to_items.setdefault(tuple(row.tolist()), []).append(item_id)
+
+    tok_eval, stg_eval = prefix_seqs(histories, history_codes, freeze_depth)
+    max_len = max(len(tokens) for tokens in tok_eval)
+    tok = torch.from_numpy(pad(tok_eval, max_len)).long().to(device)
+    stg = torch.from_numpy(pad(stg_eval, max_len)).long().to(device)
+    lengths = torch.tensor([len(tokens) for tokens in tok_eval], device=device)
+    padding_mask = torch.arange(max_len, device=device)[None, :] >= lengths[:, None]
+
+    budgets = sorted({int(value) for value in budget_values})
+    max_budget = max(budgets)
+    rows = []
+    for n_beams in beam_values:
+        print(
+            f"evaluating {strategy} grid beams={n_beams} "
+            f"budgets={','.join(str(value) for value in budgets)}",
+            flush=True,
+        )
+        accumulators = {
+            budget: {
+                "hits": {cutoff: 0 for cutoff in RANKING_CUTOFFS},
+                "dcg": {cutoff: 0.0 for cutoff in RANKING_CUTOFFS},
+                "conditional_hits": {
+                    cutoff: 0 for cutoff in RANKING_CUTOFFS
+                },
+                "conditional_dcg": {
+                    cutoff: 0.0 for cutoff in RANKING_CUTOFFS
+                },
+                "coverage": 0,
+                "uncapped_coverage": 0,
+                "candidate_counts": [],
+                "uncapped_candidate_counts": [],
+                "truncated_queries": 0,
+            }
+            for budget in budgets
+        }
+        started = time.perf_counter()
+        for start in range(0, len(eval_t1), 64):
+            end = min(start + 64, len(eval_t1))
+            prefixes, _ = model.generate_prefixes(
+                tok[start:end], stg[start:end], n_beams=n_beams,
+                padding_mask=padding_mask[start:end],
+            )
+            for local in range(end - start):
+                candidate_set = set()
+                for prefix in prefixes[local]:
+                    candidate_set.update(prefix_to_items.get(tuple(prefix), ()))
+                uncapped_count = len(candidate_set)
+                target = targets[start + local]
+                uncapped_hit = int(target in candidate_set)
+                for acc in accumulators.values():
+                    acc["uncapped_candidate_counts"].append(uncapped_count)
+                    acc["uncapped_coverage"] += uncapped_hit
+                if not candidate_set:
+                    for acc in accumulators.values():
+                        acc["candidate_counts"].append(0)
+                    continue
+
+                candidates = np.asarray(sorted(candidate_set), dtype=np.int64)
+                history = histories[start + local]
+                query = embeddings[history[-3:]].mean(axis=0)
+                distances = np.sum((item_decoded[candidates] - query) ** 2, axis=1)
+                if len(candidates) > max_budget:
+                    keep = np.argpartition(distances, max_budget - 1)[
+                        :max_budget
+                    ]
+                    order = keep[np.argsort(distances[keep])]
+                else:
+                    order = np.argsort(distances)
+                ranked = candidates[order]
+
+                for budget, acc in accumulators.items():
+                    candidate_count = min(len(candidates), budget)
+                    acc["candidate_counts"].append(candidate_count)
+                    acc["truncated_queries"] += int(len(candidates) > budget)
+                    limited = ranked[:candidate_count]
+                    target_positions = np.flatnonzero(limited == target)
+                    target_rank = (
+                        int(target_positions[0]) if len(target_positions)
+                        else None
+                    )
+                    covered = target_rank is not None
+                    acc["coverage"] += int(covered)
+                    target_gain = (
+                        1.0 / math.log2(target_rank + 2)
+                        if target_rank is not None else 0.0
+                    )
+                    for cutoff in RANKING_CUTOFFS:
+                        hit = target_rank is not None and target_rank < cutoff
+                        acc["hits"][cutoff] += int(hit)
+                        acc["dcg"][cutoff] += target_gain if hit else 0.0
+                        acc["conditional_hits"][cutoff] += int(hit and covered)
+                        acc["conditional_dcg"][cutoff] += (
+                            target_gain if hit and covered else 0.0
+                        )
+
+        elapsed = time.perf_counter() - started
+        total = len(eval_t1)
+        for budget, acc in accumulators.items():
+            candidate_counts = np.asarray(
+                acc["candidate_counts"], dtype=np.float64,
+            )
+            uncapped_counts = np.asarray(
+                acc["uncapped_candidate_counts"], dtype=np.float64,
+            )
+            if len(candidate_counts):
+                candidate_mean = float(candidate_counts.mean())
+                candidate_p50 = float(np.percentile(candidate_counts, 50))
+                candidate_p95 = float(np.percentile(candidate_counts, 95))
+                uncapped_mean = float(uncapped_counts.mean())
+                uncapped_p50 = float(np.percentile(uncapped_counts, 50))
+                uncapped_p95 = float(np.percentile(uncapped_counts, 95))
+            else:
+                candidate_mean = candidate_p50 = candidate_p95 = 0.0
+                uncapped_mean = uncapped_p50 = uncapped_p95 = 0.0
+            metrics = {
+                "strategy": strategy,
+                "n_beams": n_beams,
+                "candidate_budget": budget,
+                "candidate_grid": True,
+                "n_eval": total,
+                "candidate_budget_mode": "exact_query_distance_topk",
+                "candidate_budget_exact_scan_simulation": True,
+                "routing_coverage": acc["coverage"] / max(total, 1),
+                "uncapped_routing_coverage": (
+                    acc["uncapped_coverage"] / max(total, 1)
+                ),
+                "candidate_pool_truncated_fraction": (
+                    acc["truncated_queries"] / max(total, 1)
+                ),
+                "evaluation_seconds": elapsed,
+                "query_milliseconds": 1000.0 * elapsed / max(total, 1),
+                "candidate_count_mean": candidate_mean,
+                "candidate_count_p50": candidate_p50,
+                "candidate_count_p95": candidate_p95,
+                "uncapped_candidate_count_mean": uncapped_mean,
+                "uncapped_candidate_count_p50": uncapped_p50,
+                "uncapped_candidate_count_p95": uncapped_p95,
+                "items_returned_mean": candidate_mean,
+                "items_returned_p50": candidate_p50,
+                "items_returned_p95": candidate_p95,
+                "items_accessed_mean": uncapped_mean,
+                "items_accessed_p50": uncapped_p50,
+                "items_accessed_p95": uncapped_p95,
+            }
+            for cutoff in RANKING_CUTOFFS:
+                hit_rate = acc["hits"][cutoff] / max(total, 1)
+                conditional_hit_rate = (
+                    acc["conditional_hits"][cutoff]
+                    / max(acc["coverage"], 1)
+                )
+                metrics[f"hit_rate_at_{cutoff}"] = hit_rate
+                metrics[f"recall_at_{cutoff}"] = hit_rate
+                metrics[f"ndcg_at_{cutoff}"] = (
+                    acc["dcg"][cutoff] / max(total, 1)
+                )
+                metrics[f"conditional_hit_rate_at_{cutoff}"] = (
+                    conditional_hit_rate
+                )
+                metrics[f"conditional_recall_at_{cutoff}"] = (
+                    conditional_hit_rate
+                )
+                metrics[f"conditional_ndcg_at_{cutoff}"] = (
+                    acc["conditional_dcg"][cutoff] / max(acc["coverage"], 1)
+                )
+            rows.append(metrics)
+    return rows
+
+
 def run_seed(args) -> None:
     output = Path(args.output)
     if output.exists() and not args.overwrite:
@@ -1031,6 +1230,7 @@ def run_seed(args) -> None:
             "n_beams": args.n_beams,
             "beam_values": args.beam_values,
             "candidate_budget_values": args.candidate_budget_values,
+            "candidate_grid_beam_values": args.candidate_grid_beam_values,
             "run_train_sequence_limit": args.run_train_sequence_limit,
             "run_eval_sequence_limit": args.run_eval_sequence_limit,
             "run_train_sequences": len(seqs_t0),
@@ -1055,6 +1255,7 @@ def run_seed(args) -> None:
         "strategies": [],
         "beam_sweep": [],
         "candidate_budget_sweep": [],
+        "candidate_grid_sweep": [],
     }
     _write_json(output, payload)
 
@@ -1254,6 +1455,12 @@ def run_seed(args) -> None:
             freeze_depth, args.n_beams, args.candidate_budget_values,
             args.device, name, item_prefix_mapping,
         ))
+        payload["candidate_grid_sweep"].extend(evaluate_candidate_grid_sweep(
+            model, eval_t1, history_rq, item_rq, embeddings_t1,
+            freeze_depth, args.candidate_grid_beam_values,
+            args.candidate_budget_values, args.device, name,
+            item_prefix_mapping,
+        ))
         _write_json(output, payload)
 
     if args.skip_rebuilt_consumer:
@@ -1262,7 +1469,8 @@ def run_seed(args) -> None:
             if isinstance(value, float)
         ) + sum(row["evaluation_seconds"] for row in payload["strategies"]) \
             + sum(row["evaluation_seconds"] for row in payload["beam_sweep"]) \
-            + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"])
+            + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"]) \
+            + sum(row["evaluation_seconds"] for row in payload["candidate_grid_sweep"])
         _write_json(output, payload)
         print(json.dumps(payload, indent=2, default=_json_default), flush=True)
         return
@@ -1317,6 +1525,12 @@ def run_seed(args) -> None:
         grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
         freeze_depth, args.n_beams, args.candidate_budget_values,
         args.device, "grm_only_retrained_generator",
+    ))
+    payload["candidate_grid_sweep"].extend(evaluate_candidate_grid_sweep(
+        grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
+        freeze_depth, args.candidate_grid_beam_values,
+        args.candidate_budget_values, args.device,
+        "grm_only_retrained_generator",
     ))
     _write_json(output, payload)
 
@@ -1374,11 +1588,18 @@ def run_seed(args) -> None:
         freeze_depth, args.n_beams, args.candidate_budget_values,
         args.device, "full_retrained_generator",
     ))
+    payload["candidate_grid_sweep"].extend(evaluate_candidate_grid_sweep(
+        target_model, eval_t1, rq_full, rq_full, embeddings_t1,
+        freeze_depth, args.candidate_grid_beam_values,
+        args.candidate_budget_values, args.device,
+        "full_retrained_generator",
+    ))
     payload["timing"]["total_seconds"] = sum(
         value for value in payload["timing"].values() if isinstance(value, float)
     ) + sum(row["evaluation_seconds"] for row in payload["strategies"]) \
         + sum(row["evaluation_seconds"] for row in payload["beam_sweep"]) \
-        + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"])
+        + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"]) \
+        + sum(row["evaluation_seconds"] for row in payload["candidate_grid_sweep"])
     _write_json(output, payload)
     print(json.dumps(payload, indent=2, default=_json_default), flush=True)
 
@@ -1448,6 +1669,15 @@ def parse_args():
             "prefix buckets, then truncated by query distance."
         ),
     )
+    parser.add_argument(
+        "--candidate-grid-beam-values",
+        default="",
+        help=(
+            "Optional comma-separated beam counts crossed with "
+            "--candidate-budget-values. These rows measure quality, query "
+            "time, returned candidates, and accessed candidates."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--index-only", action="store_true",
@@ -1481,6 +1711,15 @@ def parse_args():
         parser.error("--candidate-budget-values must be comma-separated positive integers")
     if any(value <= 0 for value in args.candidate_budget_values):
         parser.error("--candidate-budget-values must be comma-separated positive integers")
+    try:
+        args.candidate_grid_beam_values = sorted({
+            int(value) for value in args.candidate_grid_beam_values.split(",")
+            if value
+        })
+    except ValueError:
+        parser.error("--candidate-grid-beam-values must be comma-separated positive integers")
+    if any(value <= 0 for value in args.candidate_grid_beam_values):
+        parser.error("--candidate-grid-beam-values must be comma-separated positive integers")
     if args.amazon_core_passes < 0:
         parser.error("--amazon-core-passes must be nonnegative")
     if args.max_train_sequences < 0 or args.max_eval_sequences < 0:

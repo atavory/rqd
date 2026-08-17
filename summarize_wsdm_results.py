@@ -68,6 +68,7 @@ BOUNDED_CANDIDATE_FIELDS = [
     "freeze_depth",
     "seed",
     "strategy",
+    "n_eval",
     "n_beams",
     "candidate_budget",
     "candidate_budget_mode",
@@ -95,9 +96,19 @@ BOUNDED_CANDIDATE_FIELDS = [
     "uncapped_candidate_count_mean",
     "uncapped_candidate_count_p50",
     "uncapped_candidate_count_p95",
+    "items_returned_mean",
+    "items_returned_p50",
+    "items_returned_p95",
+    "items_accessed_mean",
+    "items_accessed_p50",
+    "items_accessed_p95",
     "candidate_pool_truncated_fraction",
     "query_milliseconds",
     "evaluation_seconds",
+]
+
+CANDIDATE_GRID_FIELDS = BOUNDED_CANDIDATE_FIELDS + [
+    "candidate_grid",
 ]
 
 INDEX_RUN_FIELDS = [
@@ -406,6 +417,21 @@ def _bounded_candidate_rows(results_dir: Path) -> list[dict]:
     return rows
 
 
+def _candidate_grid_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("downstream_*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        for result in payload.get("candidate_grid_sweep", []):
+            row = dict(base)
+            row.update(result)
+            rows.append(row)
+    return rows
+
+
 def _index_rows(results_dir: Path) -> list[dict]:
     rows = []
     for path in sorted(results_dir.glob("index_*.json")):
@@ -706,6 +732,7 @@ def main() -> None:
 
     downstream = _downstream_rows(results_dir)
     bounded_candidate = _bounded_candidate_rows(results_dir)
+    candidate_grid = _candidate_grid_rows(results_dir)
     index_rows = _index_rows(results_dir)
     diagnostic_rows = _diagnostic_rows(results_dir)
     index_summary = _index_summary(index_rows)
@@ -716,6 +743,11 @@ def main() -> None:
         output_dir / "bounded_candidate_rows.csv",
         BOUNDED_CANDIDATE_FIELDS,
         bounded_candidate,
+    )
+    _write_csv(
+        output_dir / "candidate_grid_rows.csv",
+        CANDIDATE_GRID_FIELDS,
+        candidate_grid,
     )
     _write_csv(output_dir / "index_runs.csv", INDEX_RUN_FIELDS, index_rows)
     _write_csv(
@@ -730,6 +762,7 @@ def main() -> None:
     print(
         f"wrote {len(downstream)} downstream rows, "
         f"{len(bounded_candidate)} bounded-candidate rows, "
+        f"{len(candidate_grid)} candidate-grid rows, "
         f"{len(index_rows)} index rows, {len(diagnostic_rows)} diagnostics, "
         f"{len(index_summary)} index summaries, "
         f"{len(cost_summary)} cost summaries "

@@ -167,6 +167,25 @@ The generated JSON keeps uncapped strategy rows in `strategies` and writes the
 bounded-candidate rows to `candidate_budget_sweep`. The summarizer emits these
 rows as `bounded_candidate_rows.csv`.
 
+Run the denser candidate-work grid on the same trained models:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset movielens \
+  --cache data/movielens_scaled.npz \
+  --arch funnel24 --freeze-depth 2 --seed 0 \
+  --epochs 50 --n-beams 10 \
+  --candidate-budget-values 50,100,200,500,1000 \
+  --candidate-grid-beam-values 1,2,5,10 \
+  --output results/movielens_funnel24_fd2_seed0_grid.json
+```
+
+These rows are written to `candidate_grid_sweep` and summarized as
+`candidate_grid_rows.csv`. Each grid row records recommendation quality,
+query time, returned candidates, and accessed candidates. Candidate caps are
+exact-scan simulations inside predicted prefix buckets; they do not claim an
+implemented bounded ANN serving path.
+
 The companion data artifact is the canonical source for dataset URLs and
 hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
 and table-to-artifact mappings. The paper does not consume uncommitted or
