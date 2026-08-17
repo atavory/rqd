@@ -820,7 +820,8 @@ def _apply_prefix_mapping(codes, mappings):
 @torch.no_grad()
 def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
                             freeze_depth, n_beams, device,
-                            item_prefix_mapping=None):
+                            item_prefix_mapping=None,
+                            candidate_budget=None):
     histories = [history for _, history, _ in eval_t1]
     targets = [target for _, _, target in eval_t1]
     history_codes = history_rq.encode(embeddings)
@@ -844,7 +845,10 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
     conditional_hits = {cutoff: 0 for cutoff in RANKING_CUTOFFS}
     conditional_dcg = {cutoff: 0.0 for cutoff in RANKING_CUTOFFS}
     coverage = 0
+    uncapped_coverage = 0
     candidate_counts = []
+    uncapped_candidate_counts = []
+    truncated_queries = 0
     started = time.perf_counter()
     for start in range(0, len(eval_t1), 64):
         end = min(start + 64, len(eval_t1))
@@ -856,16 +860,27 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             candidate_set = set()
             for prefix in prefixes[local]:
                 candidate_set.update(prefix_to_items.get(tuple(prefix), ()))
-            candidate_counts.append(len(candidate_set))
+            uncapped_candidate_counts.append(len(candidate_set))
             if not candidate_set:
+                candidate_counts.append(0)
                 continue
             target = targets[start + local]
-            covered = target in candidate_set
-            coverage += int(covered)
             candidates = np.asarray(sorted(candidate_set), dtype=np.int64)
             history = histories[start + local]
             query = embeddings[history[-3:]].mean(axis=0)
             distances = np.sum((item_decoded[candidates] - query) ** 2, axis=1)
+            uncapped_coverage += int(target in candidate_set)
+            if candidate_budget is not None and len(candidates) > candidate_budget:
+                truncated_queries += 1
+                keep = np.argpartition(distances, candidate_budget - 1)[
+                    :candidate_budget
+                ]
+                keep = keep[np.argsort(distances[keep])]
+                candidates = candidates[keep]
+                distances = distances[keep]
+            candidate_counts.append(len(candidates))
+            covered = bool(np.any(candidates == target))
+            coverage += int(covered)
             top_count = min(max(RANKING_CUTOFFS), len(candidates))
             top = np.argpartition(distances, top_count - 1)[:top_count]
             top = top[np.argsort(distances[top])]
@@ -890,9 +905,17 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
     elapsed = time.perf_counter() - started
     total = len(eval_t1)
     candidate_counts = np.asarray(candidate_counts, dtype=np.float64)
+    uncapped_candidate_counts = np.asarray(uncapped_candidate_counts, dtype=np.float64)
     metrics = {
         "n_eval": total,
+        "candidate_budget": int(candidate_budget) if candidate_budget is not None else 0,
+        "candidate_budget_mode": (
+            "exact_query_distance_topk" if candidate_budget is not None else "uncapped"
+        ),
+        "candidate_budget_exact_scan_simulation": bool(candidate_budget is not None),
         "routing_coverage": coverage / max(total, 1),
+        "uncapped_routing_coverage": uncapped_coverage / max(total, 1),
+        "candidate_pool_truncated_fraction": truncated_queries / max(total, 1),
         "evaluation_seconds": elapsed,
         "query_milliseconds": 1000.0 * elapsed / max(total, 1),
     }
@@ -912,12 +935,22 @@ def evaluate_prefix_routing(model, eval_t1, history_rq, item_rq, embeddings,
             "candidate_count_mean": float(candidate_counts.mean()),
             "candidate_count_p50": float(np.percentile(candidate_counts, 50)),
             "candidate_count_p95": float(np.percentile(candidate_counts, 95)),
+            "uncapped_candidate_count_mean": float(uncapped_candidate_counts.mean()),
+            "uncapped_candidate_count_p50": float(np.percentile(
+                uncapped_candidate_counts, 50,
+            )),
+            "uncapped_candidate_count_p95": float(np.percentile(
+                uncapped_candidate_counts, 95,
+            )),
         })
     else:
         metrics.update({
             "candidate_count_mean": 0.0,
             "candidate_count_p50": 0.0,
             "candidate_count_p95": 0.0,
+            "uncapped_candidate_count_mean": 0.0,
+            "uncapped_candidate_count_p50": 0.0,
+            "uncapped_candidate_count_p95": 0.0,
         })
     return metrics
 
@@ -937,6 +970,30 @@ def evaluate_beam_sweep(model, eval_t1, history_rq, item_rq, embeddings,
     return rows
 
 
+def evaluate_candidate_budget_sweep(model, eval_t1, history_rq, item_rq,
+                                    embeddings, freeze_depth, n_beams,
+                                    budget_values, device, strategy,
+                                    item_prefix_mapping=None):
+    rows = []
+    for candidate_budget in budget_values:
+        print(
+            f"evaluating {strategy} with candidate budget {candidate_budget}",
+            flush=True,
+        )
+        metrics = evaluate_prefix_routing(
+            model, eval_t1, history_rq, item_rq, embeddings,
+            freeze_depth, n_beams, device, item_prefix_mapping,
+            candidate_budget=candidate_budget,
+        )
+        metrics.update({
+            "strategy": strategy,
+            "n_beams": n_beams,
+            "candidate_budget": candidate_budget,
+        })
+        rows.append(metrics)
+    return rows
+
+
 def run_seed(args) -> None:
     output = Path(args.output)
     if output.exists() and not args.overwrite:
@@ -949,6 +1006,16 @@ def run_seed(args) -> None:
     seed = args.seed
     total_bits = int(sum(round(math.log2(k)) for k in codes))
     n_items = len(embeddings_t0)
+    if args.run_train_sequence_limit:
+        seqs_t0 = _sample_sequences(
+            seqs_t0, args.run_train_sequence_limit,
+            args.sequence_sample_seed + seed,
+        )
+    if args.run_eval_sequence_limit:
+        eval_t1 = _sample_sequences(
+            eval_t1, args.run_eval_sequence_limit,
+            args.sequence_sample_seed + 1000 + seed,
+        )
 
     payload = {
         "schema_version": 3,
@@ -963,6 +1030,11 @@ def run_seed(args) -> None:
             "epochs": args.epochs,
             "n_beams": args.n_beams,
             "beam_values": args.beam_values,
+            "candidate_budget_values": args.candidate_budget_values,
+            "run_train_sequence_limit": args.run_train_sequence_limit,
+            "run_eval_sequence_limit": args.run_eval_sequence_limit,
+            "run_train_sequences": len(seqs_t0),
+            "run_eval_sequences": len(eval_t1),
             "device": args.device,
             "ema_decay": args.ema_decay,
             "ema_iterations": args.ema_iterations,
@@ -982,6 +1054,7 @@ def run_seed(args) -> None:
         "diagnostics": {},
         "strategies": [],
         "beam_sweep": [],
+        "candidate_budget_sweep": [],
     }
     _write_json(output, payload)
 
@@ -1176,6 +1249,11 @@ def run_seed(args) -> None:
             [value for value in args.beam_values if value != args.n_beams],
             args.device, name, item_prefix_mapping,
         ))
+        payload["candidate_budget_sweep"].extend(evaluate_candidate_budget_sweep(
+            model, eval_t1, history_rq, item_rq, embeddings_t1,
+            freeze_depth, args.n_beams, args.candidate_budget_values,
+            args.device, name, item_prefix_mapping,
+        ))
         _write_json(output, payload)
 
     if args.skip_rebuilt_consumer:
@@ -1183,7 +1261,8 @@ def run_seed(args) -> None:
             value for value in payload["timing"].values()
             if isinstance(value, float)
         ) + sum(row["evaluation_seconds"] for row in payload["strategies"]) \
-            + sum(row["evaluation_seconds"] for row in payload["beam_sweep"])
+            + sum(row["evaluation_seconds"] for row in payload["beam_sweep"]) \
+            + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"])
         _write_json(output, payload)
         print(json.dumps(payload, indent=2, default=_json_default), flush=True)
         return
@@ -1232,6 +1311,11 @@ def run_seed(args) -> None:
         grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
         freeze_depth,
         [value for value in args.beam_values if value != args.n_beams],
+        args.device, "grm_only_retrained_generator",
+    ))
+    payload["candidate_budget_sweep"].extend(evaluate_candidate_budget_sweep(
+        grm_model, eval_t1, rq_source, rq_source, embeddings_t1,
+        freeze_depth, args.n_beams, args.candidate_budget_values,
         args.device, "grm_only_retrained_generator",
     ))
     _write_json(output, payload)
@@ -1285,10 +1369,16 @@ def run_seed(args) -> None:
         [value for value in args.beam_values if value != args.n_beams],
         args.device, "full_retrained_generator",
     ))
+    payload["candidate_budget_sweep"].extend(evaluate_candidate_budget_sweep(
+        target_model, eval_t1, rq_full, rq_full, embeddings_t1,
+        freeze_depth, args.n_beams, args.candidate_budget_values,
+        args.device, "full_retrained_generator",
+    ))
     payload["timing"]["total_seconds"] = sum(
         value for value in payload["timing"].values() if isinstance(value, float)
     ) + sum(row["evaluation_seconds"] for row in payload["strategies"]) \
-        + sum(row["evaluation_seconds"] for row in payload["beam_sweep"])
+        + sum(row["evaluation_seconds"] for row in payload["beam_sweep"]) \
+        + sum(row["evaluation_seconds"] for row in payload["candidate_budget_sweep"])
     _write_json(output, payload)
     print(json.dumps(payload, indent=2, default=_json_default), flush=True)
 
@@ -1316,6 +1406,24 @@ def parse_args():
         help="Deterministic target-history sample; 0 keeps all",
     )
     parser.add_argument("--sequence-sample-seed", type=int, default=2026)
+    parser.add_argument(
+        "--run-train-sequence-limit",
+        type=int,
+        default=0,
+        help=(
+            "Optional deterministic train-history cap applied at seeded-run "
+            "time; 0 keeps the cache contents."
+        ),
+    )
+    parser.add_argument(
+        "--run-eval-sequence-limit",
+        type=int,
+        default=0,
+        help=(
+            "Optional deterministic evaluation-history cap applied at seeded-run "
+            "time; 0 keeps the cache contents."
+        ),
+    )
     parser.add_argument("--arch", choices=sorted(ARCHITECTURES))
     parser.add_argument("--seed", type=int)
     parser.add_argument("--epochs", type=int, default=50)
@@ -1330,6 +1438,15 @@ def parse_args():
         "--beam-values",
         default="",
         help="Optional comma-separated additional beam counts evaluated using the same models",
+    )
+    parser.add_argument(
+        "--candidate-budget-values",
+        default="",
+        help=(
+            "Optional comma-separated candidate-pool caps for extra diagnostic "
+            "rows. Candidates are still found by exact scan inside predicted "
+            "prefix buckets, then truncated by query distance."
+        ),
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -1355,10 +1472,21 @@ def parse_args():
         parser.error("--beam-values must be comma-separated positive integers")
     if any(value <= 0 for value in args.beam_values):
         parser.error("--beam-values must be comma-separated positive integers")
+    try:
+        args.candidate_budget_values = sorted({
+            int(value) for value in args.candidate_budget_values.split(",")
+            if value
+        })
+    except ValueError:
+        parser.error("--candidate-budget-values must be comma-separated positive integers")
+    if any(value <= 0 for value in args.candidate_budget_values):
+        parser.error("--candidate-budget-values must be comma-separated positive integers")
     if args.amazon_core_passes < 0:
         parser.error("--amazon-core-passes must be nonnegative")
     if args.max_train_sequences < 0 or args.max_eval_sequences < 0:
         parser.error("sequence limits must be nonnegative")
+    if args.run_train_sequence_limit < 0 or args.run_eval_sequence_limit < 0:
+        parser.error("run sequence limits must be nonnegative")
     if not 0.0 <= args.ema_decay < 1.0:
         parser.error("--ema-decay must be in [0, 1)")
     if args.ema_iterations <= 0:

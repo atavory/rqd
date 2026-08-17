@@ -59,6 +59,47 @@ DOWNSTREAM_FIELDS = [
     "evaluation_seconds",
 ]
 
+BOUNDED_CANDIDATE_FIELDS = [
+    "artifact",
+    "dataset",
+    "arch",
+    "codebook_sizes",
+    "total_bits",
+    "freeze_depth",
+    "seed",
+    "strategy",
+    "n_beams",
+    "candidate_budget",
+    "candidate_budget_mode",
+    "candidate_budget_exact_scan_simulation",
+    "hit_rate_at_5",
+    "hit_rate_at_10",
+    "hit_rate_at_20",
+    "hit_rate_at_50",
+    "hit_rate_at_200",
+    "ndcg_at_5",
+    "ndcg_at_10",
+    "ndcg_at_20",
+    "ndcg_at_50",
+    "ndcg_at_200",
+    "recall_at_5",
+    "recall_at_10",
+    "recall_at_20",
+    "recall_at_50",
+    "recall_at_200",
+    "routing_coverage",
+    "uncapped_routing_coverage",
+    "candidate_count_mean",
+    "candidate_count_p50",
+    "candidate_count_p95",
+    "uncapped_candidate_count_mean",
+    "uncapped_candidate_count_p50",
+    "uncapped_candidate_count_p95",
+    "candidate_pool_truncated_fraction",
+    "query_milliseconds",
+    "evaluation_seconds",
+]
+
 INDEX_RUN_FIELDS = [
     "artifact",
     "dataset",
@@ -346,6 +387,21 @@ def _downstream_rows(results_dir: Path) -> list[dict]:
             row["prefix_churn_headline"] = _headline_churn(strategy)
             row["items_reindexed_headline"] = _headline_items(strategy)
             _fill_cost_fields(row, payload)
+            rows.append(row)
+    return rows
+
+
+def _bounded_candidate_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("downstream_*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        for result in payload.get("candidate_budget_sweep", []):
+            row = dict(base)
+            row.update(result)
             rows.append(row)
     return rows
 
@@ -649,12 +705,18 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     downstream = _downstream_rows(results_dir)
+    bounded_candidate = _bounded_candidate_rows(results_dir)
     index_rows = _index_rows(results_dir)
     diagnostic_rows = _diagnostic_rows(results_dir)
     index_summary = _index_summary(index_rows)
     cost_summary = _cost_summary(downstream)
 
     _write_csv(output_dir / "downstream_rows.csv", DOWNSTREAM_FIELDS, downstream)
+    _write_csv(
+        output_dir / "bounded_candidate_rows.csv",
+        BOUNDED_CANDIDATE_FIELDS,
+        bounded_candidate,
+    )
     _write_csv(output_dir / "index_runs.csv", INDEX_RUN_FIELDS, index_rows)
     _write_csv(
         output_dir / "diagnostic_rows.csv", DIAGNOSTIC_FIELDS, diagnostic_rows,
@@ -667,6 +729,7 @@ def main() -> None:
     )
     print(
         f"wrote {len(downstream)} downstream rows, "
+        f"{len(bounded_candidate)} bounded-candidate rows, "
         f"{len(index_rows)} index rows, {len(diagnostic_rows)} diagnostics, "
         f"{len(index_summary)} index summaries, "
         f"{len(cost_summary)} cost summaries "

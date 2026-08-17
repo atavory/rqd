@@ -54,6 +54,13 @@ five-core benchmark. It provides:
 - HR/NDCG/Recall at standard cutoffs, routing coverage, candidate work, MSE,
   prefix churn, reindex counts, and codebook-update size in one JSON artifact
   per seed;
+- optional bounded-candidate diagnostics via `--candidate-budget-values`.
+  These rows keep the prefix-beam generator fixed, expand the generated prefix
+  buckets, then retain only the top candidate budget by query-to-decoded-vector
+  distance. They are labeled `candidate_budget_exact_scan_simulation=true`
+  because the current script simulates a bounded returned pool but still uses an
+  exact scan inside the generated buckets; a production-efficiency claim needs
+  a real within-bucket index or ANN implementation.
 - raw token churn together with centroid-Hungarian and assignment-optimal
   label-aligned churn, so arbitrary k-means token permutations are not
   mistaken for genuine interface changes.
@@ -143,6 +150,22 @@ python3 run_wsdm_web_recsys.py \
   --epochs 50 --n-beams 10 --beam-values 1,5,10 \
   --output results/movielens_funnel24_fd2_seed0.json
 ```
+
+Run the bounded-candidate diagnostic axis on the same trained models:
+
+```bash
+python3 run_wsdm_web_recsys.py \
+  --dataset movielens \
+  --cache data/movielens_scaled.npz \
+  --arch funnel24 --freeze-depth 2 --seed 0 \
+  --epochs 50 --n-beams 10 \
+  --candidate-budget-values 200,500,1000 \
+  --output results/movielens_funnel24_fd2_seed0_bounded.json
+```
+
+The generated JSON keeps uncapped strategy rows in `strategies` and writes the
+bounded-candidate rows to `candidate_budget_sweep`. The summarizer emits these
+rows as `bounded_candidate_rows.csv`.
 
 The companion data artifact is the canonical source for dataset URLs and
 hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
