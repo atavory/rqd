@@ -111,6 +111,67 @@ CANDIDATE_GRID_FIELDS = BOUNDED_CANDIDATE_FIELDS + [
     "candidate_grid",
 ]
 
+CONTEXT_RERANKER_FIELDS = [
+    "artifact",
+    "dataset",
+    "arch",
+    "codebook_sizes",
+    "freeze_depth",
+    "seed",
+    "strategy",
+    "scorer",
+    "n_eval",
+    "n_beams",
+    "candidate_budget",
+    "candidate_budget_mode",
+    "candidate_budget_exact_scan_simulation",
+    "hit_rate_at_5",
+    "hit_rate_at_10",
+    "hit_rate_at_20",
+    "hit_rate_at_50",
+    "hit_rate_at_200",
+    "ndcg_at_5",
+    "ndcg_at_10",
+    "ndcg_at_20",
+    "ndcg_at_50",
+    "ndcg_at_200",
+    "recall_at_5",
+    "recall_at_10",
+    "recall_at_20",
+    "recall_at_50",
+    "recall_at_200",
+    "routing_coverage",
+    "uncapped_routing_coverage",
+    "candidate_count_mean",
+    "candidate_count_p50",
+    "candidate_count_p95",
+    "uncapped_candidate_count_mean",
+    "uncapped_candidate_count_p50",
+    "uncapped_candidate_count_p95",
+    "items_returned_mean",
+    "items_returned_p50",
+    "items_returned_p95",
+    "items_accessed_mean",
+    "items_accessed_p50",
+    "items_accessed_p95",
+    "candidate_pool_truncated_fraction",
+    "query_milliseconds",
+    "evaluation_seconds",
+    "mse",
+    "prefix_churn_headline",
+    "prefix_churn_raw",
+    "prefix_churn_centroid_aligned",
+    "prefix_churn_assignment_aligned",
+    "items_reindexed_headline",
+    "codebook_update_bytes",
+    "tokenizer_update_seconds",
+    "update_wall_seconds",
+]
+
+CONTEXT_RERANKER_GRID_FIELDS = CONTEXT_RERANKER_FIELDS + [
+    "candidate_grid",
+]
+
 INDEX_RUN_FIELDS = [
     "artifact",
     "dataset",
@@ -432,6 +493,36 @@ def _candidate_grid_rows(results_dir: Path) -> list[dict]:
     return rows
 
 
+def _context_reranker_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("context_*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        for result in payload.get("context_reranker_rows", []):
+            row = dict(base)
+            row.update(result)
+            rows.append(row)
+    return rows
+
+
+def _context_reranker_grid_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("context_*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        for result in payload.get("context_reranker_grid", []):
+            row = dict(base)
+            row.update(result)
+            rows.append(row)
+    return rows
+
+
 def _index_rows(results_dir: Path) -> list[dict]:
     rows = []
     for path in sorted(results_dir.glob("index_*.json")):
@@ -733,6 +824,8 @@ def main() -> None:
     downstream = _downstream_rows(results_dir)
     bounded_candidate = _bounded_candidate_rows(results_dir)
     candidate_grid = _candidate_grid_rows(results_dir)
+    context_reranker = _context_reranker_rows(results_dir)
+    context_reranker_grid = _context_reranker_grid_rows(results_dir)
     index_rows = _index_rows(results_dir)
     diagnostic_rows = _diagnostic_rows(results_dir)
     index_summary = _index_summary(index_rows)
@@ -749,6 +842,16 @@ def main() -> None:
         CANDIDATE_GRID_FIELDS,
         candidate_grid,
     )
+    _write_csv(
+        output_dir / "context_reranker_rows.csv",
+        CONTEXT_RERANKER_FIELDS,
+        context_reranker,
+    )
+    _write_csv(
+        output_dir / "context_reranker_grid_rows.csv",
+        CONTEXT_RERANKER_GRID_FIELDS,
+        context_reranker_grid,
+    )
     _write_csv(output_dir / "index_runs.csv", INDEX_RUN_FIELDS, index_rows)
     _write_csv(
         output_dir / "diagnostic_rows.csv", DIAGNOSTIC_FIELDS, diagnostic_rows,
@@ -763,6 +866,8 @@ def main() -> None:
         f"wrote {len(downstream)} downstream rows, "
         f"{len(bounded_candidate)} bounded-candidate rows, "
         f"{len(candidate_grid)} candidate-grid rows, "
+        f"{len(context_reranker)} context-reranker rows, "
+        f"{len(context_reranker_grid)} context-reranker grid rows, "
         f"{len(index_rows)} index rows, {len(diagnostic_rows)} diagnostics, "
         f"{len(index_summary)} index summaries, "
         f"{len(cost_summary)} cost summaries "

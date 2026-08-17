@@ -186,6 +186,28 @@ query time, returned candidates, and accessed candidates. Candidate caps are
 exact-scan simulations inside predicted prefix buckets; they do not claim an
 implemented bounded ANN serving path.
 
+Run the learned context-reranker variant:
+
+```bash
+python3 run_context_reranker_recsys.py \
+  --cache data/movielens_scaled.npz \
+  --arch funnel24 --freeze-depth 2 --seed 0 \
+  --epochs 50 --scorer-epochs 20 \
+  --n-beams 10 \
+  --candidate-budget-values 200,500,1000 \
+  --candidate-grid-beam-values 10 \
+  --output results/context_movielens_funnel24_fd2_seed0.json
+```
+
+This is the paper-facing routed recommendation path. The generator predicts
+stable prefix tokens from the history. A learned projection maps the
+sequence-model hidden state to a query vector, and candidates in generated
+prefix buckets are ranked by `q(X)^T v_Q(i)`, where `v_Q(i)` is the decoded
+item vector under the tokenizer being evaluated. The fixed last-items scorer
+is obsolete and should not be used for recommender-quality claims.
+The summarizer emits `context_reranker_rows.csv` and
+`context_reranker_grid_rows.csv`.
+
 The companion data artifact is the canonical source for dataset URLs and
 hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
 and table-to-artifact mappings. The paper does not consume uncommitted or

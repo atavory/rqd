@@ -437,6 +437,88 @@ def _collect_candidate_grid(result_dirs: list[Path]) -> list[dict]:
     return rows
 
 
+def _collect_context_reranker(
+    result_dirs: list[Path],
+) -> tuple[list[dict], list[dict]]:
+    rows = []
+    grid = []
+    for result_dir in result_dirs:
+        for path in sorted(result_dir.glob("context_*.json")):
+            payload = _read_json(path)
+            config = payload.get("configuration", {})
+            base = {
+                "artifact": path.name,
+                "result_dir": str(result_dir),
+                "dataset": _dataset_name(payload),
+                "arch": config.get("arch", ""),
+                "codebook_sizes": _codebook_sizes(config),
+                "freeze_depth": config.get("freeze_depth", ""),
+                "seed": config.get("seed", ""),
+            }
+            for source, target in [
+                ("context_reranker_rows", rows),
+                ("context_reranker_grid", grid),
+            ]:
+                for result in payload.get(source, []):
+                    row = dict(base)
+                    row.update({
+                        "strategy": result.get("strategy", ""),
+                        "scorer": result.get("scorer", ""),
+                        "n_eval": result.get("n_eval", ""),
+                        "n_beams": result.get("n_beams", ""),
+                        "candidate_budget": result.get("candidate_budget", ""),
+                        "candidate_budget_mode": result.get(
+                            "candidate_budget_mode", ""
+                        ),
+                        "candidate_budget_exact_scan_simulation": result.get(
+                            "candidate_budget_exact_scan_simulation", ""
+                        ),
+                        "ndcg_at_10": result.get("ndcg_at_10", ""),
+                        "ndcg_at_20": result.get("ndcg_at_20", ""),
+                        "recall_at_10": result.get("recall_at_10", ""),
+                        "recall_at_20": result.get("recall_at_20", ""),
+                        "recall_at_50": result.get("recall_at_50", ""),
+                        "recall_at_200": result.get("recall_at_200", ""),
+                        "routing_coverage": result.get("routing_coverage", ""),
+                        "uncapped_routing_coverage": result.get(
+                            "uncapped_routing_coverage", ""
+                        ),
+                        "items_returned_mean": result.get(
+                            "items_returned_mean", ""
+                        ),
+                        "items_accessed_mean": result.get(
+                            "items_accessed_mean", ""
+                        ),
+                        "candidate_pool_truncated_fraction": result.get(
+                            "candidate_pool_truncated_fraction", ""
+                        ),
+                        "query_milliseconds": result.get(
+                            "query_milliseconds", ""
+                        ),
+                        "evaluation_seconds": result.get(
+                            "evaluation_seconds", ""
+                        ),
+                        "mse": result.get("mse", ""),
+                        "prefix_churn_headline": _headline_churn(result),
+                        "items_reindexed_headline": result.get(
+                            "items_reindexed_headline",
+                            result.get(
+                                "items_reindexed_assignment_aligned",
+                                result.get("items_reindexed", ""),
+                            ),
+                        ),
+                        "codebook_update_bytes": result.get(
+                            "codebook_update_bytes", ""
+                        ),
+                        "update_wall_seconds": result.get(
+                            "update_wall_seconds", ""
+                        ),
+                        "candidate_grid": result.get("candidate_grid", ""),
+                    })
+                    target.append(row)
+    return rows, grid
+
+
 def _collect_index(result_dirs: list[Path]) -> tuple[list[dict], list[dict]]:
     rows = []
     coverage = []
@@ -1384,6 +1466,8 @@ def _readme(output_dir: Path, args) -> str:
         "- `csv/`: normalized row-level and headline CSVs.",
         "- `csv/bounded_candidate_rows.csv`: returned-candidate budget rows.",
         "- `csv/candidate_grid_rows.csv`: beam-by-budget candidate-work rows.",
+        "- `csv/context_reranker_rows.csv`: learned context-dot reranker rows.",
+        "- `csv/context_reranker_grid_rows.csv`: learned reranker work grid.",
         "- `tables/`: generated LaTeX tables.",
         "- `plot_data/`: CSV inputs for generated figures.",
         "- `figures/`: PGFPlots snippets that read `plot_data/`.",
@@ -1455,6 +1539,9 @@ def main() -> None:
     downstream_rows, downstream_coverage = _collect_downstream(result_dirs)
     bounded_candidate_rows = _collect_bounded_candidate(result_dirs)
     candidate_grid_rows = _collect_candidate_grid(result_dirs)
+    context_reranker_rows, context_reranker_grid_rows = (
+        _collect_context_reranker(result_dirs)
+    )
     index_rows, index_coverage = _collect_index(result_dirs)
     real_tier_c_rows = _read_csv(tier_c_real)
     synthetic_tier_c_rows = _read_csv(tier_c_synthetic)
@@ -1622,6 +1709,51 @@ def main() -> None:
             "query_milliseconds",
             "evaluation_seconds",
         ],
+    )
+    context_fields = [
+        "artifact",
+        "result_dir",
+        "dataset",
+        "arch",
+        "codebook_sizes",
+        "freeze_depth",
+        "seed",
+        "strategy",
+        "scorer",
+        "n_eval",
+        "n_beams",
+        "candidate_budget",
+        "candidate_budget_mode",
+        "candidate_budget_exact_scan_simulation",
+        "ndcg_at_10",
+        "ndcg_at_20",
+        "recall_at_10",
+        "recall_at_20",
+        "recall_at_50",
+        "recall_at_200",
+        "routing_coverage",
+        "uncapped_routing_coverage",
+        "items_returned_mean",
+        "items_accessed_mean",
+        "candidate_pool_truncated_fraction",
+        "query_milliseconds",
+        "evaluation_seconds",
+        "mse",
+        "prefix_churn_headline",
+        "items_reindexed_headline",
+        "codebook_update_bytes",
+        "update_wall_seconds",
+        "candidate_grid",
+    ]
+    _write_csv(
+        output_dir / "csv/context_reranker_rows.csv",
+        context_reranker_rows,
+        context_fields,
+    )
+    _write_csv(
+        output_dir / "csv/context_reranker_grid_rows.csv",
+        context_reranker_grid_rows,
+        context_fields,
     )
     _write_csv(
         output_dir / "csv/index_rows.csv",
@@ -1854,6 +1986,8 @@ def main() -> None:
             "downstream_rows": len(downstream_rows),
             "bounded_candidate_rows": len(bounded_candidate_rows),
             "candidate_grid_rows": len(candidate_grid_rows),
+            "context_reranker_rows": len(context_reranker_rows),
+            "context_reranker_grid_rows": len(context_reranker_grid_rows),
             "index_rows": len(index_rows),
             "tier_c_real_rows": tier_c["real_rows"],
             "tier_c_synthetic_rows": tier_c["synthetic_rows"],
