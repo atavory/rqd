@@ -14,7 +14,10 @@ CANDIDATE_GRID_BEAM_VALUES=${CANDIDATE_GRID_BEAM_VALUES:-10}
 MOVIELENS_EVAL_LIMIT=${MOVIELENS_EVAL_LIMIT:-1000}
 AMAZON2018_TRAIN_LIMIT=${AMAZON2018_TRAIN_LIMIT:-10000}
 AMAZON2018_EVAL_LIMIT=${AMAZON2018_EVAL_LIMIT:-1000}
+INCLUDE_MOVIELENS=${INCLUDE_MOVIELENS:-1}
 INCLUDE_AMAZON2018=${INCLUDE_AMAZON2018:-1}
+MOVIELENS_SEEDS=${MOVIELENS_SEEDS:-0 1 2 3 4}
+AMAZON2018_SEEDS=${AMAZON2018_SEEDS:-0 1 2}
 WAIT_FOR_BOUNDED_QUEUE=${WAIT_FOR_BOUNDED_QUEUE:-1}
 
 mkdir -p "$OUT"
@@ -111,21 +114,23 @@ run_one() {
 log "context-reranker queue start OUT=$OUT DEVICE=$DEVICE"
 wait_for_bounded_queue
 
-for seed in 0 1 2 3 4; do
-  for fd in 2 3; do
-    run_one \
-      movielens \
-      "$ROOT/cache/movielens64.npz" \
-      funnel24 \
-      "$fd" \
-      "$seed" \
-      0 \
-      "$MOVIELENS_EVAL_LIMIT"
+if [[ "$INCLUDE_MOVIELENS" == "1" ]]; then
+  for seed in $MOVIELENS_SEEDS; do
+    for fd in 2 3; do
+      run_one \
+        movielens \
+        "$ROOT/cache/movielens64.npz" \
+        funnel24 \
+        "$fd" \
+        "$seed" \
+        0 \
+        "$MOVIELENS_EVAL_LIMIT"
+    done
   done
-done
+fi
 
 if [[ "$INCLUDE_AMAZON2018" == "1" ]]; then
-  for seed in 0 1 2; do
+  for seed in $AMAZON2018_SEEDS; do
     for fd in 2 3; do
       run_one \
         amazon2018_electronics \

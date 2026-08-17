@@ -208,6 +208,21 @@ is obsolete and should not be used for recommender-quality claims.
 The summarizer emits `context_reranker_rows.csv` and
 `context_reranker_grid_rows.csv`.
 
+Run a queue shard with explicit dataset and seed ownership:
+
+```bash
+DEVICE=cuda:0 \
+INCLUDE_MOVIELENS=0 \
+INCLUDE_AMAZON2018=1 \
+AMAZON2018_SEEDS="0 1 2" \
+WAIT_FOR_BOUNDED_QUEUE=0 \
+./run_context_reranker_queue_20260817.sh
+```
+
+Use a separate `OUT` directory for each machine, then aggregate all
+`context_*.json` files through `summarize_wsdm_results.py` or
+`make_wsdm_overleaf_analysis.py`.
+
 The companion data artifact is the canonical source for dataset URLs and
 hashes, filtering/alignment metadata, per-seed JSONs, committed CSV aggregates,
 and table-to-artifact mappings. The paper does not consume uncommitted or
