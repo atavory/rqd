@@ -3,6 +3,21 @@
 Public experiment code for maintaining semantic-ID interfaces as embedding
 models and interaction logs evolve.
 
+## Current status: WSDM 2027 shutdown
+
+As of 2026-08-17, the WSDM 2027 submission effort is shut down and should not
+be treated as an active paper-run queue. The generative-recommender claim is not
+supported strongly enough for submission: frozen, retrained, and stratified
+end-to-end systems show mixed results, and the learned context-reranker rows are
+too weak for a broad downstream ranking claim.
+
+The code and partial results remain useful for post-mortem analysis and for a
+future retrieval/interface paper. The strongest remaining lead is narrower:
+semantic-ID drift in generative recommenders behaves like output-vocabulary
+drift, and new-item repair/grafting can help under compatibility constraints.
+See `WSDM_STATUS_20260817.md` for the shutdown note, evidence summary, and
+future direction.
+
 ## Paper-facing analysis contract
 
 This repository is the canonical public source for analysis and run scripts.

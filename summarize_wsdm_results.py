@@ -172,6 +172,25 @@ CONTEXT_RERANKER_GRID_FIELDS = CONTEXT_RERANKER_FIELDS + [
     "candidate_grid",
 ]
 
+TARGET_ITEM_SPLIT_FIELDS = [
+    "target_item_split",
+    "target_item_split_n_eval",
+    "target_item_split_fraction",
+    "n_eval",
+]
+
+DOWNSTREAM_TARGET_ITEM_SPLIT_FIELDS = [
+    *DOWNSTREAM_FIELDS[:7],
+    *TARGET_ITEM_SPLIT_FIELDS,
+    *DOWNSTREAM_FIELDS[7:],
+]
+
+CONTEXT_RERANKER_TARGET_ITEM_SPLIT_FIELDS = [
+    *CONTEXT_RERANKER_FIELDS[:6],
+    *TARGET_ITEM_SPLIT_FIELDS,
+    *CONTEXT_RERANKER_FIELDS[6:],
+]
+
 INDEX_RUN_FIELDS = [
     "artifact",
     "dataset",
@@ -463,6 +482,26 @@ def _downstream_rows(results_dir: Path) -> list[dict]:
     return rows
 
 
+def _downstream_target_item_split_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        diagnostics = payload.get("diagnostics", {})
+        for result in payload.get("target_item_split_rows", []):
+            row = dict(base)
+            row.update(result)
+            row.update(diagnostics)
+            row["prefix_churn_headline"] = _headline_churn(result)
+            row["items_reindexed_headline"] = _headline_items(result)
+            _fill_cost_fields(row, payload)
+            rows.append(row)
+    return rows
+
+
 def _bounded_candidate_rows(results_dir: Path) -> list[dict]:
     rows = []
     for path in sorted(results_dir.glob("downstream_*.json")):
@@ -517,6 +556,21 @@ def _context_reranker_grid_rows(results_dir: Path) -> list[dict]:
             "freeze_depth", ""
         )
         for result in payload.get("context_reranker_grid", []):
+            row = dict(base)
+            row.update(result)
+            rows.append(row)
+    return rows
+
+
+def _context_reranker_target_item_split_rows(results_dir: Path) -> list[dict]:
+    rows = []
+    for path in sorted(results_dir.glob("*.json")):
+        payload = _read_json(path)
+        base = _base_fields(path, payload)
+        base["freeze_depth"] = payload.get("configuration", {}).get(
+            "freeze_depth", ""
+        )
+        for result in payload.get("context_reranker_target_item_split_rows", []):
             row = dict(base)
             row.update(result)
             rows.append(row)
@@ -822,16 +876,25 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     downstream = _downstream_rows(results_dir)
+    downstream_target_split = _downstream_target_item_split_rows(results_dir)
     bounded_candidate = _bounded_candidate_rows(results_dir)
     candidate_grid = _candidate_grid_rows(results_dir)
     context_reranker = _context_reranker_rows(results_dir)
     context_reranker_grid = _context_reranker_grid_rows(results_dir)
+    context_reranker_target_split = _context_reranker_target_item_split_rows(
+        results_dir,
+    )
     index_rows = _index_rows(results_dir)
     diagnostic_rows = _diagnostic_rows(results_dir)
     index_summary = _index_summary(index_rows)
     cost_summary = _cost_summary(downstream)
 
     _write_csv(output_dir / "downstream_rows.csv", DOWNSTREAM_FIELDS, downstream)
+    _write_csv(
+        output_dir / "target_item_split_rows.csv",
+        DOWNSTREAM_TARGET_ITEM_SPLIT_FIELDS,
+        downstream_target_split,
+    )
     _write_csv(
         output_dir / "bounded_candidate_rows.csv",
         BOUNDED_CANDIDATE_FIELDS,
@@ -852,6 +915,11 @@ def main() -> None:
         CONTEXT_RERANKER_GRID_FIELDS,
         context_reranker_grid,
     )
+    _write_csv(
+        output_dir / "context_reranker_target_item_split_rows.csv",
+        CONTEXT_RERANKER_TARGET_ITEM_SPLIT_FIELDS,
+        context_reranker_target_split,
+    )
     _write_csv(output_dir / "index_runs.csv", INDEX_RUN_FIELDS, index_rows)
     _write_csv(
         output_dir / "diagnostic_rows.csv", DIAGNOSTIC_FIELDS, diagnostic_rows,
@@ -864,10 +932,12 @@ def main() -> None:
     )
     print(
         f"wrote {len(downstream)} downstream rows, "
+        f"{len(downstream_target_split)} target-split rows, "
         f"{len(bounded_candidate)} bounded-candidate rows, "
         f"{len(candidate_grid)} candidate-grid rows, "
         f"{len(context_reranker)} context-reranker rows, "
         f"{len(context_reranker_grid)} context-reranker grid rows, "
+        f"{len(context_reranker_target_split)} context-reranker target-split rows, "
         f"{len(index_rows)} index rows, {len(diagnostic_rows)} diagnostics, "
         f"{len(index_summary)} index summaries, "
         f"{len(cost_summary)} cost summaries "

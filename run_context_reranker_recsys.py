@@ -39,9 +39,11 @@ from run_wsdm_web_recsys import (
     _churn_payload,
     _codebook_bytes,
     _json_default,
+    _new_item_full_graft_artifacts,
     _prefix_churn_metrics,
     _sample_sequences,
     _strategy_cost_payload,
+    _target_item_split_eval_t1,
     _tier_c_diagnostics,
     _tokenizer_update_seconds_for_strategy,
     _write_json,
@@ -200,12 +202,20 @@ def evaluate_context_routing(
     item_prefix_mapping=None,
     candidate_budget=None,
     normalize: bool = True,
+    item_codes_override=None,
+    item_vectors_override=None,
 ):
     histories = [history for _, history, _ in eval_t1]
     targets = [target for _, _, target in eval_t1]
     history_codes = history_rq.encode(embeddings)
-    item_codes_raw = item_rq.encode(embeddings)
-    item_vectors = item_rq.decode_codes(item_codes_raw)
+    if item_codes_override is None:
+        item_codes_raw = item_rq.encode(embeddings)
+    else:
+        item_codes_raw = item_codes_override
+    if item_vectors_override is None:
+        item_vectors = item_rq.decode_codes(item_codes_raw)
+    else:
+        item_vectors = item_vectors_override
     item_codes = _apply_prefix_mapping(item_codes_raw, item_prefix_mapping)
     item_vectors_t = _normalized_vectors(item_vectors, normalize).to(device)
 
@@ -426,6 +436,7 @@ def run_seed(args) -> None:
         "diagnostics": {},
         "context_reranker_rows": [],
         "context_reranker_grid": [],
+        "context_reranker_target_item_split_rows": [],
     }
     _write_json(output, payload)
 
@@ -531,6 +542,165 @@ def run_seed(args) -> None:
         ),
     ]
 
+    if args.fix1_target_split_only:
+        payload["configuration"]["mode"] = "fix1_target_split_only"
+        payload["configuration"]["fix1_target_splits"] = args.fix1_target_splits
+        split_eval_t1 = _target_item_split_eval_t1(
+            embeddings_t0, embeddings_t1, eval_t1,
+        )
+        if args.fix1_target_splits:
+            requested_splits = {
+                value for value in args.fix1_target_splits.split(",")
+                if value
+            }
+            unknown_splits = requested_splits - set(split_eval_t1)
+            if unknown_splits:
+                raise ValueError(
+                    "unknown target splits: "
+                    + ", ".join(sorted(unknown_splits))
+                )
+            split_eval_t1 = {
+                name: rows for name, rows in split_eval_t1.items()
+                if name in requested_splits
+            }
+        new_item_graft = _new_item_full_graft_artifacts(
+            rq_source, rq_full, embeddings_t0, embeddings_t1,
+        )
+        new_item_graft_refresh_existing = _new_item_full_graft_artifacts(
+            rq_source, rq_full, embeddings_t0, embeddings_t1,
+            refresh_existing=True,
+        )
+
+        fix1_strategies = [
+            {
+                "name": "frozen",
+                "item_rq": rq_source,
+                "churn": zero_churn,
+            },
+            {
+                "name": "stratified",
+                "item_rq": rq_stratified,
+                "churn": zero_churn,
+            },
+            {
+                "name": "new_item_full_graft_static_existing",
+                "item_rq": rq_full,
+                "churn": zero_churn,
+                "item_codes_override": new_item_graft["codes"],
+                "item_vectors_override": new_item_graft["decoded"],
+                "mse": new_item_graft["mse"],
+                "new_item_count": new_item_graft["new_item_count"],
+                "new_item_fraction": new_item_graft["new_item_fraction"],
+                "tokenizer_update_seconds": payload["timing"][
+                    "full_codebook_seconds"
+                ],
+                "codebook_update_bytes": _codebook_bytes(rq_full),
+            },
+            {
+                "name": "new_item_full_graft_frozen_existing",
+                "item_rq": rq_full,
+                "churn": zero_churn,
+                "item_codes_override": new_item_graft_refresh_existing[
+                    "codes"
+                ],
+                "item_vectors_override": new_item_graft_refresh_existing[
+                    "decoded"
+                ],
+                "mse": new_item_graft_refresh_existing["mse"],
+                "new_item_count": new_item_graft_refresh_existing[
+                    "new_item_count"
+                ],
+                "new_item_fraction": new_item_graft_refresh_existing[
+                    "new_item_fraction"
+                ],
+                "tokenizer_update_seconds": payload["timing"][
+                    "full_codebook_seconds"
+                ],
+                "codebook_update_bytes": _codebook_bytes(rq_full),
+            },
+            {
+                "name": "full_old_model",
+                "item_rq": rq_full,
+                "churn": full_churn,
+            },
+            {
+                "name": "full_old_model_assignment_relabel",
+                "item_rq": rq_full,
+                "churn": full_churn,
+                "item_prefix_mapping": full_mappings["assignment_optimal"],
+            },
+        ]
+        for strategy in fix1_strategies:
+            name = strategy["name"]
+            item_rq = strategy["item_rq"]
+            churn = strategy["churn"]
+            item_prefix_mapping = strategy.get("item_prefix_mapping")
+            for split_name, split_rows in split_eval_t1.items():
+                if not split_rows:
+                    continue
+                print(
+                    f"evaluating context reranker {name} "
+                    f"target_split={split_name}",
+                    flush=True,
+                )
+                metrics = evaluate_context_routing(
+                    model, projection, split_rows, rq_source, item_rq,
+                    embeddings_t1, freeze_depth, args.n_beams, args.device,
+                    item_prefix_mapping=item_prefix_mapping,
+                    normalize=args.scorer_normalize,
+                    item_codes_override=strategy.get("item_codes_override"),
+                    item_vectors_override=strategy.get(
+                        "item_vectors_override"
+                    ),
+                )
+                codebook_update_bytes = (
+                    strategy["codebook_update_bytes"]
+                    if "codebook_update_bytes" in strategy else
+                    0 if name == "frozen" else
+                    _codebook_bytes(item_rq, range(freeze_depth, 4))
+                    if name == "stratified" else _codebook_bytes(item_rq)
+                )
+                metrics.update({
+                    "strategy": name,
+                    "target_item_split": split_name,
+                    "target_item_split_n_eval": len(split_rows),
+                    "target_item_split_fraction": (
+                        len(split_rows) / max(len(eval_t1), 1)
+                    ),
+                    "mse": strategy.get("mse", item_rq.mse(embeddings_t1)),
+                    **_churn_payload(churn, n_items),
+                    **_strategy_cost_payload(
+                        codebook_update_bytes=codebook_update_bytes,
+                        tokenizer_update_seconds=(
+                            strategy["tokenizer_update_seconds"]
+                            if "tokenizer_update_seconds" in strategy else
+                            _tokenizer_update_seconds_for_strategy(
+                                name, payload["timing"],
+                            )
+                        ),
+                    ),
+                })
+                if "new_item_count" in strategy:
+                    metrics["new_item_graft_count"] = strategy["new_item_count"]
+                    metrics["new_item_graft_fraction"] = strategy[
+                        "new_item_fraction"
+                    ]
+                payload["context_reranker_target_item_split_rows"].append(
+                    metrics,
+                )
+                _write_json(output, payload)
+
+        payload["timing"]["total_seconds"] = sum(
+            value for value in payload["timing"].values()
+            if isinstance(value, float)
+        ) + sum(
+            row["evaluation_seconds"]
+            for row in payload["context_reranker_target_item_split_rows"]
+        )
+        _write_json(output, payload)
+        print(json.dumps(payload, indent=2, default=_json_default), flush=True)
+        return
+
     for name, item_rq, churn, item_prefix_mapping in strategies:
         print(f"evaluating context reranker {name}", flush=True)
         metrics = evaluate_context_routing(
@@ -601,6 +771,24 @@ def parse_args():
     parser.add_argument("--sequence-sample-seed", type=int, default=2026)
     parser.add_argument("--ema-decay", type=float, default=0.95)
     parser.add_argument("--ema-iterations", type=int, default=20)
+    parser.add_argument(
+        "--fix1-target-split-only",
+        action="store_true",
+        help=(
+            "Train the source prefix generator/scorer, then evaluate context "
+            "reranker rows separately for all, carried-source-nonzero, and "
+            "new-source-zero target items."
+        ),
+    )
+    parser.add_argument(
+        "--fix1-target-splits",
+        default="",
+        help=(
+            "Optional comma-separated subset of FIX-1 splits to evaluate. "
+            "Valid values: all, carried_source_nonzero, "
+            "new_source_zero_target_nonzero."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", required=True)
     parser.add_argument("--overwrite", action="store_true")

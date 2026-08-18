@@ -1,5 +1,10 @@
 # Remote GPU Bundle - WSDM Semantic-ID Runs
 
+Status as of 2026-08-17: historical bundle only. Do not restart these queues as
+part of the WSDM 2027 submission. The active submission effort has been shut
+down; use this bundle only to reproduce or audit the post-mortem evidence in
+`WSDM_STATUS_20260817.md`.
+
 This bundle is self-contained for the next GPU machine. It includes:
 
 - `rqd/`: public experiment runner code;
@@ -68,4 +73,3 @@ integration or a documented substitute.
 
 Interpret results as Pareto/frontier and rung-selection evidence, not as a
 "better ranking without retraining" claim.
-
